@@ -237,8 +237,10 @@ its timing is not guessed from the picture: the scene lists everything audible i
 cd ~/claude-code/animations
 npx remotion still src/index.ts <Id> /tmp/x.png --props='{"passes":1,"sky":"spruit_sunrise","scans":true,"events":true}' 2>&1 \
   | grep -o 'EVENTS {.*}' | sed 's/^EVENTS //' > out/garden_events.json     # renders nothing, stops with the list
-node ~/.claude/skills/js3d-broll/scripts/garden_sound.mjs out/garden_events.json out/garden_sound.wav
+node ~/.claude/skills/js3d-broll/scripts/garden_sound.mjs out/garden_events.json out/garden_sound_v2.wav out/garden_sound_mix.json
 ```
+
+The third argument names recordings to use (below); without it every sound is computed (`out/garden_sound.wav`).
 
 - **`events` prop** (the block before the render targets in `build`). Contacts come from the stored physics tracks:
   a jump of more than 0.5 m/s in a body's downward speed between two samples is a contact, with its time, speed,
@@ -257,14 +259,40 @@ node ~/.claude/skills/js3d-broll/scripts/garden_sound.mjs out/garden_events.json
   --cues garden_sound.cues.json`: 14 of 16 cues with an onset within 40 ms, chance 12 %; the other two are the
   silent dips). A cue itself is as exact as its source: physics samples are 8 ms
   apart, key frames are exact. Levels: thumps peak at -12 to -15 dBFS, hops near -31, pecks near -35.
-- **What it does not do, said plainly.** earshot (local models, no paid service; never its `llm` commands without
-  Ben's OK) hears the sounds as what they are: the apple thump reads as "a kick drum / a punchy impact hit", hops
-  and pecks as key clicks. Three noise-based thumps read as snare hits instead, so the sine version stayed. Use the
-  file as a timing track and placeholder, not as finished foley.
-- **No wind or leaves in it.** Four synthetic beds (band-passed noise following the gusts, grains, flicker) read as
-  ocean waves, a crackling fire or static, never as leaves (forced choice against "wind in the leaves of a tree":
-  under 1 % each time). That bed has to be a recording; shape its level with `wind.tree` from the events file so it
-  swells with the gusts in the picture. The robin's dips are cues without a sound for the same reason.
+- **Computed sounds are exact in time and wrong in character.** earshot (local models, no paid service; never its
+  `llm` commands without Ben's OK) hears the computed apple thump as "a kick drum" (forced choice 85 %, "a dull
+  thud" under 1 %), three noise-based thumps as snare hits, hops and pecks as key clicks. Four computed wind beds
+  (band-passed noise following the gusts, grains, flicker) read as ocean waves, a crackling fire or static, never
+  as leaves. Wind, leaves, birdsong and thuds are a recording's job; code keeps the timing.
+- **`mix.json` puts recordings on the scene's clock** (`out/garden_sound_mix.json`; gains in dB, times in seconds,
+  files 16-bit WAV at 48 kHz, made with `ffmpeg -i x.ogg -ar 48000 -c:a pcm_s16le x.wav`):
+  - `bed`: an ambience from `from` seconds on, as long as the clip. Its gain rides `wind.tree`, +-`swing`/2 dB, so
+    it swells with the gusts that move the crown. Measured per half second against the same bed without swing: within
+    0.3 dB of the curve.
+  - `songs`: phrases (`from`, `to`) placed at `at` with `gain` and `pan`, 20 ms fades. Put them where no contact
+    is: the garden's contacts run from 2.23 to 6.87 s, so the blackbird phrase sits at 0.2-2.1 s. Find phrases by
+    the recording's level (a gap of 0.35 s under 8 % of its peak ends one).
+  - `thud`: replaces the computed apple thump, cut to its first sample above 2 % of its peak and scaled by landing
+    speed as before. It starts on the cue to 0.01 ms; its loudest point comes 22 ms later (the recording's own rise).
+- **The recordings** (2026-11-11, Wikimedia Commons, downloaded with Ben's OK into `out/sound_src/`, list with
+  licence and source page in `SOURCES.json` there; judge every new one with `earshot describe / match / realness`
+  before using it, and leave out what does not read as its name):
+  - `Gentle_breeze_and_birds_singing.ogg` (public domain), bed, seconds 2.5-10.5 (12-16 s has a loud blackcap that
+    would fight the contacts): reads "a quiet countryside morning", "wind in pine trees"; against "a gentle breeze
+    in the leaves of a tree with birds singing" strong (z +3.4, forced choice over 99 %), p_real 0.90.
+  - `Turdus_merula_2.ogg` (public domain), phrase 1.35-3.25 s: "a bird chirping" z +3.9, "a blackbird singing" z +5.0.
+  - `Dull_thud.ogg` (public domain), as placed on the first apple: "a punchy impact hit" z +3.5, "a heavy thud" z +2.8, p_real 0.99. Against
+    "an apple falling on grass" only weak (z +1.8 to +2.2, forced choice 1-5 %): a real thud, not yet an apple on
+    turf. Better than the computed one, still the weakest part.
+  - Not used: `20090610_0_ambience.ogg` (peaks at 0.1 dBFS and crows), `Birds_singing_in_garden.ogg` and
+    `Common_blackbird_singing_denoised.flac` (both read right; the bed already has birds, and its phrase is 2.3 s,
+    too long for the gap).
+- **The mix** `out/garden_sound_v2.wav`: 8.000 s, -33.3 LUFS, true peak -13.5 dBTP (Ben sets the level in
+  CapCut). earshot: "skylarks over a meadow", "a quiet countryside morning"; against "a garden with a
+  breeze in the trees, birds singing and fruit falling on the grass" strong (z +3.3, forced choice over 99 %),
+  p_real 0.90. Its onset detector finds all 16 cues within 100 ms and 81 % within 40 ms (chance 29 %); in a mix
+  that number is blurred by the bed's own bird calls, so the exact check stays the solo one above.
+- The robin's dips are cues without a sound: nothing was computed or looked for.
 - When checking sync by measurement, render each event alone: with two events 50 ms apart the tail of the first
   hides the start of the second and the reading comes out as "-50 ms".
 
