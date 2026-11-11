@@ -5,6 +5,7 @@ import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { HDRLoader } from "three/examples/jsm/loaders/HDRLoader.js";
 import { WebGLPathTracer } from "three-gpu-pathtracer";
+import RAPIER from "@dimforge/rapier3d-deterministic-compat";
 import { AbsoluteFill, cancelRender, continueRender, delayRender, staticFile, useCurrentFrame } from "remotion";
 
 // js3d-broll, outdoor worked example: a garden at golden hour, built from nothing (no Blender original, no assets).
@@ -17,7 +18,7 @@ import { AbsoluteFill, cancelRender, continueRender, delayRender, staticFile, us
 //   - fur: shells (the mesh drawn 18 times, pushed out along the normal, strands cut out by a 3D hash)
 // Everything is in Blender's Z-up coordinates inside `root`. A frame is a pure function of the frame number.
 
-const W = 1080, H = 1920;
+const W = 1080, H = 1920, FRAMES = 240;
 type V3 = THREE.Vector3;
 type Key = [number, number[]];
 const V = (x = 0, y = 0, z = 0) => new THREE.Vector3(x, y, z);
@@ -399,10 +400,20 @@ diffuseColor.rgb *= (0.5 + 0.5 * vH) * (0.75 + 0.5 * fr);`), [1.0, 0.8, 0.55]);
   const o = new THREE.Group(); o.add(skin); if (!PLAIN) o.add(shells); return o;
 }
 
+// ---------------------------------------------------------------- stored physics (see build)
+const HZ = 120, PRE = 4;                             // samples kept per second; seconds simulated before frame 0
+type Track = { o: THREE.Object3D; d: Float32Array };  // position + quaternion, 7 numbers per sample
+const _q = new THREE.Quaternion();
+function play(tr: Track, t: number) {                // put the object where its body was at time t
+  const d = tr.d, u = Math.min(Math.max(t * HZ, 0), d.length / 7 - 1.001), i = Math.floor(u), f = u - i, a = i * 7, b = a + 7;
+  tr.o.position.set(d[a] + (d[b] - d[a]) * f, d[a + 1] + (d[b + 1] - d[a + 1]) * f, d[a + 2] + (d[b + 2] - d[a + 2]) * f);
+  tr.o.quaternion.set(d[a + 3], d[a + 4], d[a + 5], d[a + 6]).slerp(_q.set(d[b + 3], d[b + 4], d[b + 5], d[b + 6]), f);
+}
+
 // ---------------------------------------------------------------- tree
 type Twig = { p: V3; d: V3 };
 function growTree(R: () => number, base: V3, s: number, maxDepth: number) {
-  const wood: THREE.BufferGeometry[] = [], twigs: Twig[] = [];
+  const wood: THREE.BufferGeometry[] = [], twigs: Twig[] = [], knots: { p: V3; r: number }[] = [];
   const grow = (p0: V3, d0: V3, len: number, r0: number, depth: number) => {
     const thin = r0 < 0.02 * s, n = Math.max(3, Math.round(len / ((thin ? 0.06 : 0.12) * s)));
     const pts = [p0], rs = [r0], ds = [d0.clone()];
@@ -413,6 +424,7 @@ function growTree(R: () => number, base: V3, s: number, maxDepth: number) {
       d.add(V(R() - 0.5, R() - 0.5, R() - 0.5).multiplyScalar(depth ? 0.24 : 0.13)).add(V(0, 0, depth === 0 ? 0.03 : depth === 1 ? 0.09 * u - 0.02 : depth >= 3 ? -0.03 : 0.02)).normalize();
       p = p.clone().addScaledVector(d, len / n); pts.push(p); ds.push(d.clone()); rs.push(r0 * (1 - 0.72 * u ** 1.2));
       if (rs[i] < 0.02 * s) twigs.push({ p, d: d.clone() });        // thin wood carries the leaves
+      else if (depth) knots.push({ p, r: rs[i] });                  // thick limbs can carry something
     }
     wood.push(limb(pts, rs, depth === 0 ? 24 : thin ? 5 : 9, depth === 0 ? base.z : null));
     if (depth >= maxDepth) return;
@@ -428,7 +440,7 @@ function growTree(R: () => number, base: V3, s: number, maxDepth: number) {
     }
   };
   grow(base.clone().add(V(0, 0, -0.1)), V(0.12 * (R() - 0.5), 0.12 * (R() - 0.5), 1).normalize(), 4.3 * s, 0.13 * s, 0);
-  return { wood: mergeGeometries(wood), twigs };
+  return { wood: mergeGeometries(wood), twigs, knots };
 }
 function leafOut(sc: Scatter, R: () => number, twigs: Twig[], centre: V3, per: number, size: number, ca: number[], cb: number[]) {
   for (const { p, d } of twigs) for (let i = 0; i < per; i++) {
@@ -602,13 +614,14 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
 
   // stepping stones, bird bath, fence
   const R = rng(7);
+  const stoneGs: THREE.BufferGeometry[] = [];
   const stoneM = new THREE.MeshStandardMaterial(S ? S.stone : { ...stone, bumpScale: 1.5, roughness: 0.85 });
   for (const [x, y, r] of STONES) {
     const ph = R() * 9, rr = (a: number, k: number) => r * k * (1 + 0.16 * Math.sin(2 * a + ph) + 0.09 * Math.sin(3 * a + 2 * ph) + 0.05 * Math.sin(5 * a + ph));
     const rg = (z: number, k: number) => Array.from({ length: 20 }, (_, i) => { const a = (i / 20) * TAU; return V(x + rr(a, k) * Math.cos(a), y + rr(a, k) * Math.sin(a), gz(x, y) + z); });
     const g = solid([rg(-0.03, 0.9), rg(0.0, 1), rg(0.028, 0.99), rg(0.04, 0.9)], [G(x, y, -0.03), G(x, y, 0.042)]), P = g.attributes.position;
     g.setAttribute("uv", new THREE.Float32BufferAttribute(Array.from({ length: P.count }, (_, i) => [P.getX(i) * 1.3, P.getY(i) * 1.3]).flat(), 2));
-    put(g, stoneM);
+    put(g, stoneM); stoneGs.push(g);
   }
   const bathG = new THREE.LatheGeometry([[0.001, 0], [0.2, 0], [0.19, 0.035], [0.08, 0.09], [0.058, 0.2], [0.055, 0.5], [0.085, 0.58], [0.29, 0.655], [0.32, 0.69], [0.318, 0.705], [0.3, 0.705], [0.27, 0.675], [0.001, 0.645]]
     .map((p) => new THREE.Vector2(p[0], p[1])), 48).rotateX(Math.PI / 2);
@@ -631,11 +644,14 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
   const main = growTree(rng(11), G(TREE.x, TREE.y), 1, 4);
   put(main.wood, barkM);
   leafOut(leaves, rng(12), main.twigs, V(TREE.x, TREE.y, 3.0), 14, 0.085, leafA, leafB);
-  const RA = rng(13);
-  for (let i = 0; i < 46; i++) {                                    // apples hanging under the twigs
+  const RA = rng(13), hang = Array.from({ length: 46 }, () => {     // apples hanging under the twigs
     const t = main.twigs[Math.floor(RA() * main.twigs.length)], s = 0.03 + 0.008 * RA();
-    apples.add(t.p.clone().add(V(0, 0, -s - 0.01)), quat(V(RA() - 0.5, RA() - 0.5, 3).normalize(), X), [s, s * 0.9, s], mix(lin([0.62, 0.08, 0.05]), lin([0.62, 0.62, 0.16]), RA() ** 2), Z, RA());
-  }
+    return { p: t.p.clone().add(V(0, 0, -s - 0.01)), q: quat(V(RA() - 0.5, RA() - 0.5, 3).normalize(), X), s, c: mix(lin([0.62, 0.08, 0.05]), lin([0.62, 0.62, 0.16]), RA() ** 2), r: RA() };
+  });
+  const inView = (p: V3) => Math.abs(p.x + 0.55 - 0.1 * (p.y + 5.3)) < 0.24 * (p.y + 5.3) - 0.25 && Math.hypot(p.x - BATH.x, p.y - BATH.y) > 0.6;
+  const falling: typeof hang = [];                                  // the three nearest the camera will drop (physics below)
+  for (const a of hang.filter((a) => inView(a.p)).sort((a, b) => a.p.y - b.p.y)) if (falling.length < 3 && falling.every((f) => Math.hypot(f.p.x - a.p.x, f.p.y - a.p.y) > 0.5)) falling.push(a);
+  for (const a of hang) if (!falling.includes(a)) apples.add(a.p, a.q, [a.s, a.s * 0.9, a.s], a.c, Z, a.r);
   for (const [x, y, s, seed] of [[-5.6, 10.5, 1.9, 21], [1.6, 13.5, 2.2, 22], [5.4, 15.5, 1.8, 23]]) {
     const t = growTree(rng(seed), G(x, y), s, 3);
     put(t.wood, barkM);
@@ -735,8 +751,69 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
   const leafM = patch(new THREE.MeshStandardMaterial({ color: col(lin([0.70, 0.56, 0.14])), roughness: 0.6, side: THREE.DoubleSide }), { trans: LEAF_T });
   const drops = [[30, -0.25, 0.85, 3.1, 0.4], [112, 0.35, 1.2, 2.8, 2.1]].map((d) => { const o = put(leafG, leafM); o.scale.setScalar(0.085); return [o, ...d] as [THREE.Mesh, ...number[]]; });
 
+  // ---------------------------------------------------------------- physics, simulated once here and stored
+  // Rapier steps the world at 240 Hz from PRE seconds before frame 0 (so what hangs is already swinging) to the end of
+  // the clip, and every body's position and rotation is kept at HZ samples per second. A frame then only looks its
+  // moment up (play), so frames stay a pure function of the frame number and sub-frame times still blur.
+  await RAPIER.init();
+  const world = new RAPIER.World({ x: 0, y: 0, z: -9.81 }); world.timestep = 1 / 240; world.numSolverIterations = 8;
+  const UPQ = { x: Math.SQRT1_2, y: 0, z: 0, w: Math.SQRT1_2 };     // Rapier's capsules lie along Y: this stands them up (Z)
+  const solidMesh = (g: THREE.BufferGeometry, off: V3, bounce: number) => {   // something to land on, from its own triangles
+    const P = g.attributes.position, v = new Float32Array(P.count * 3);
+    for (let i = 0; i < P.count; i++) { v[i * 3] = P.getX(i) + off.x; v[i * 3 + 1] = P.getY(i) + off.y; v[i * 3 + 2] = P.getZ(i) + off.z; }
+    world.createCollider(RAPIER.ColliderDesc.trimesh(v, Uint32Array.from(g.index!.array)).setRestitution(bounce).setFriction(0.9));
+  };
+  const lawnG = new THREE.PlaneGeometry(9, 12, 72, 96).translate(0, 1, 0), lp = lawnG.attributes.position;
+  for (let i = 0; i < lp.count; i++) lp.setZ(i, gz(lp.getX(i), lp.getY(i)) + 0.02);   // the turf, a little above the soil
+  solidMesh(lawnG, V(), 0.1); for (const g of stoneGs) solidMesh(g, V(), 0.35); solidMesh(bathG, bath.position, 0.3);
+  world.createCollider(RAPIER.ColliderDesc.capsule(0.9, 0.15).setRotation(UPQ).setTranslation(TREE.x, TREE.y, 0.9));
+  world.createCollider(RAPIER.ColliderDesc.ball(0.1).setTranslation(RABBIT.x, RABBIT.y, 0.08));   // the rabbit is in the way too
+  // a bird house on a cord from the limb nearest to HANG: cord and house are two bodies on ball joints, the wind pushes the house
+  const HANG = V(-1.2, 1.5, 2.9), CORD = 0.85;
+  const knot = main.knots.filter((k) => k.r > 0.022).sort((a, b) => a.p.distanceTo(HANG) - b.p.distanceTo(HANG))[0], A0 = knot.p.clone().add(V(0, 0, -knot.r));
+  const nail = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(A0.x, A0.y, A0.z));
+  const cordB = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(A0.x, A0.y, A0.z - CORD / 2).setAngularDamping(0.3));
+  world.createCollider(RAPIER.ColliderDesc.capsule(CORD / 2, 0.004).setRotation(UPQ).setDensity(500).setCollisionGroups(0), cordB);   // weight only, touches nothing
+  const houseB = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(A0.x, A0.y, A0.z - CORD - 0.09).setLinearDamping(0.15).setAngularDamping(0.8));
+  world.createCollider(RAPIER.ColliderDesc.cuboid(0.07, 0.07, 0.08).setDensity(130).setRestitution(0.3), houseB);
+  world.createImpulseJoint(RAPIER.JointData.spherical({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: CORD / 2 }), nail, cordB, true);
+  world.createImpulseJoint(RAPIER.JointData.spherical({ x: 0, y: 0, z: -CORD / 2 }, { x: 0, y: 0, z: 0.09 }), cordB, houseB, true);
+  const houseM = S ? new THREE.MeshStandardMaterial({ ...S.wood, color: col([0.85, 0.7, 0.55]) }) : std([0.45, 0.33, 0.22], 0.8), dark = std([0.05, 0.04, 0.035], 0.8);
+  const cordO = put(new THREE.CylinderGeometry(0.003, 0.003, CORD, 6).rotateX(Math.PI / 2), std([0.35, 0.3, 0.22], 0.9)), houseO = new THREE.Group();
+  put(new THREE.BoxGeometry(0.14, 0.14, 0.16), houseM, houseO);
+  put(new THREE.ConeGeometry(0.125, 0.075, 4).rotateX(Math.PI / 2).rotateZ(Math.PI / 4).translate(0, 0, 0.1175), std([0.16, 0.13, 0.11], 0.85), houseO);
+  put(new THREE.CircleGeometry(0.022, 20).rotateX(Math.PI / 2).translate(0, -0.0705, 0.02), dark, houseO);
+  put(stick(V(0, -0.07, -0.035), V(0, -0.115, -0.035), 0.004), dark, houseO);
+  root.add(houseO);
+  // three apples let go, one after the other
+  const appleG = new THREE.SphereGeometry(1, 20, 14);
+  const drop = falling.map((a, i) => {
+    const o = put(appleG, new THREE.MeshPhysicalMaterial({ color: col(a.c), roughness: 0.38, clearcoat: 0.4, clearcoatRoughness: 0.25 }));
+    o.scale.set(a.s, a.s * 0.9, a.s);
+    return { ...a, o, at: [1.5, 3.9, 5.6][i], b: null as RAPIER.RigidBody | null };
+  });
+  const NS_ = Math.round((FRAMES / 30 + 0.1) * HZ), tracks: Track[] = [cordO, houseO, ...drop.map((d) => d.o)].map((o) => ({ o, d: new Float32Array(NS_ * 7) }));
+  for (let k = 0, n = 0; n < NS_; k++) {
+    const t = k / 240 - PRE;
+    for (const a of drop) if (!a.b && t >= a.at) {
+      a.b = world.createRigidBody(RAPIER.RigidBodyDesc.dynamic().setTranslation(a.p.x, a.p.y, a.p.z).setRotation(a.q).setLinearDamping(0.05).setAngularDamping(1.5).setCcdEnabled(true));
+      world.createCollider(RAPIER.ColliderDesc.ball(a.s * 0.95).setDensity(800).setRestitution(0.25).setFriction(0.9), a.b);
+    }
+    const g = 0.18 + 0.15 * Math.sin(1.3 * t) + 0.06 * Math.sin(4.7 * t + 1);                     // the wind on the house, newtons
+    houseB.resetForces(true); houseB.addForce({ x: 0.9 * g, y: 0.45 * g, z: 0 }, true);
+    world.step();
+    if (t < 0 || k % (240 / HZ)) continue;
+    [cordB, houseB, ...drop.map((d) => d.b)].forEach((b, j) => {
+      const p = b ? b.translation() : drop[j - 2].p, q = b ? b.rotation() : drop[j - 2].q;
+      tracks[j].d.set([p.x, p.y, p.z, q.x, q.y, q.z, q.w], n * 7);
+    });
+    n++;
+  }
+  world.free();
+
   // ---------------------------------------------------------------- animation (a pure function of the frame)
-  const HEAD: Key[] = [[0, [38, 0, 36, 36]], [100, [38, 0, 36, 36]], [111, [-4, 8, 8, 10]], [150, [-8, 30, 4, 12]], [186, [-5, 22, 8, 6]], [214, [36, 0, 32, 34]], [239, [38, 0, 36, 36]]];
+  // the rabbit: head pitch, head yaw, ears back (frame 69: an apple thumps down beside it; 111: the blackbird arrives)
+  const HEAD: Key[] = [[0, [38, 0, 36, 36]], [69, [38, 0, 36, 36]], [73, [0, -18, 4, 6]], [84, [6, -22, 8, 12]], [100, [34, -4, 32, 34]], [111, [-4, 8, 8, 10]], [150, [-8, 30, 4, 12]], [186, [-5, 22, 8, 6]], [214, [36, 0, 32, 34]], [239, [38, 0, 36, 36]]];
   const HOPS = [62, 71, 80, 89, 98, 107];                          // the blackbird's hops, 5 frames each, onto the third stone
   const BB: Key[] = [[0, [0, 0, 0]], [118, [0, 0, 0]], [121, [0, 28, 30]], [136, [0, 28, 30]], [139, [58, 0, 0]], [143, [58, 0, 0]], [147, [0, 0, -20]],
     [158, [0, 0, -20]], [161, [60, 0, 5]], [165, [60, 0, 5]], [169, [-6, 0, 40]], [196, [-6, 0, 40]], [199, [-4, -25, -30]], [239, [-4, -25, -30]]];   // body pitch, head roll, head yaw
@@ -757,6 +834,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
     const by = -1.95 - 0.1 * (bx + 1.36), onStone = sm((bx + 0.68) / 0.1) * 0.04, [bp, hr, hy] = spline(fr, BB);
     blackbird.g.position.copy(G(bx, by, bz + onStone)); blackbird.g.rotation.z = rad(-90 + 12 * sm((fr - 196) / 4));
     blackbird.tilt.rotation.x = -rad(bp + 14 * lift); blackbird.head.rotation.set(rad(-0.5 * bp), rad(hr), rad(hy), "ZXY");
+    for (const tr of tracks) play(tr, t);
     const [rp, ry] = spline(fr, RB);
     robin.g.rotation.z = rad(-72); robin.tilt.rotation.x = -rad(rp); robin.head.rotation.set(rad(-0.35 * rp), 0, rad(ry), "ZXY");
     flies.forEach((b, i) => {                                       // butterflies: a wandering path, the body bobbing against each wing beat
@@ -778,7 +856,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
       o.rotation.set(0.9 * Math.sin(2.6 * sl + ph) * air + (1 - air) * 0.1, 2.2 * sl * air, 1.4 * sl + ph);
       o.visible = fr >= f0;
     }
-    const k = fr / 239, L = (a: number[], b: number[]) => V(a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k);
+    const k = fr / (FRAMES - 1), L = (a: number[], b: number[]) => V(a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k);
     const loc = L(CAM[0][1], CAM[1][1]);
     return { loc, tgt: L(CAM[0][2], CAM[1][2]), lens: CAM[0][3] + (CAM[1][3] - CAM[0][3]) * k, focus: loc.distanceTo(V(RABBIT.x, RABBIT.y, 0.12)) };
   }

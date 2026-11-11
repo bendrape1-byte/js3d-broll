@@ -32,10 +32,11 @@ The Remotion project `~/claude-code/animations` already has three.js and renders
 mkdir -p ~/claude-code/animations/public/js3d && cp ~/.claude/skills/js3d-broll/assets/agx_mhc_65.bin ~/claude-code/animations/public/js3d/
 ```
 
-`GardenScene.tsx` imports the path tracer (its reference mode, see below), so that template needs two packages:
+`GardenScene.tsx` imports the path tracer (its reference mode, see below) and the physics engine, so that template
+needs three packages:
 
 ```bash
-cd ~/claude-code/animations && npm i three-gpu-pathtracer@0.0.27 three-mesh-bvh
+cd ~/claude-code/animations && npm i three-gpu-pathtracer@0.0.27 three-mesh-bvh && npm i --save-exact @dimforge/rapier3d-deterministic-compat@0.21.0
 ```
 
 For outdoor scenes, a sky photo (23.8 MB, CC0; ask Ben before downloading, others are listed at polyhaven.com/hdris),
@@ -114,6 +115,21 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
   `LEAF_LUM`. In PLAIN mode the leaves fall back to the generated shape (a baked card would be a rectangle).
   Cost: the cut-out leaves doubled the clip's render time (240 frames: 188 s -> 401 s). A card covers about three
   times the area of the old leaf shape and every fragment of it reads the mask, in two shadow passes and the picture.
+- **Physics is simulated once and stored** (`@dimforge/rapier3d-deterministic-compat`, the block before the
+  animation in `build`). Rapier steps the world at 240 Hz from `PRE` = 4 s before frame 0 (so whatever hangs is
+  already swinging) to the end of the clip; every body's position and rotation is kept 120 times a second, and a
+  frame only looks its moment up (`play(track, t)`, interpolated). Frames stay a pure function of the frame number,
+  Remotion may still render them in any order, and sub-frame times still motion-blur. Never step the world per frame.
+  - Colliders come from the meshes themselves (`solidMesh`: lawn patch, stones, bird bath as triangle meshes), in
+    Blender coordinates with gravity on -Z. Rapier's capsules lie along Y: rotate them (`UPQ`) to stand up.
+  - A body that lets go later (an apple at 1.5 s) is created at that step; until then its track holds the rest pose.
+  - Something on a cord = two bodies on ball joints (cord + load), the cord with collision groups 0 so it only
+    weighs. Drive it with a force, not with keys. Keep the forcing away from the pendulum's own frequency
+    (sqrt(g / length), 3.2 rad/s for 0.94 m): with part of the wind at 2.9 rad/s the bird house swung +-16 deg; with
+    that part moved to 4.7 rad/s and the force cut by a third it swings +-5 deg (both read from the stored track).
+  - Read the stored tracks out before rendering (where each body ends, when it first bounces): the first apple lands
+    beside the rabbit at frame 69, so the rabbit's keys got a startle there. Physics gives the event, keys react to it.
+  - Cost: 0.1 s at build for this scene (5 bodies, 12 s at 240 Hz). The render time does not change.
 - **Sunset photos have a very low sun** (8-12 deg in the three tested; a 1.5 m fence throws 10 m). `SUN_AZ` turns the
   photo so its sun comes in where nothing blocks it: 70 deg (from the right) for the garden.
 - **Sky light with real occlusion.** Besides the sun, every pass adds ONE more shadow-casting directional light from
