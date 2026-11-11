@@ -228,6 +228,46 @@ What the test frames showed (frame 150, each flaw alone against the same frame w
   difference at quarter size without an outlier (here max / median 1.40, and it follows the probed camera speed,
   r = 0.83).
 
+## Sound: a separate file, timed by the scene's own data (GardenScene.tsx)
+
+The clip stays silent (Ben mixes audio in CapCut). Sound for it is a WAV next to it, exactly as long as the clip, and
+its timing is not guessed from the picture: the scene lists everything audible itself.
+
+```bash
+cd ~/claude-code/animations
+npx remotion still src/index.ts <Id> /tmp/x.png --props='{"passes":1,"sky":"spruit_sunrise","scans":true,"events":true}' 2>&1 \
+  | grep -o 'EVENTS {.*}' | sed 's/^EVENTS //' > out/garden_events.json     # renders nothing, stops with the list
+node ~/.claude/skills/js3d-broll/scripts/garden_sound.mjs out/garden_events.json out/garden_sound.wav
+```
+
+- **`events` prop** (the block before the render targets in `build`). Contacts come from the stored physics tracks:
+  a jump of more than 0.5 m/s in a body's downward speed between two samples is a contact, with its time, speed,
+  place on screen (`pan`, -1 left to 1 right, beyond that off screen) and distance. Hops, pecks and dips come from
+  the key tables (`HOPS`, and every key where a bird's body tips past 50 deg). `wind.tree` and `wind.lawn` are the
+  two GLSL wind fields again in JS (`treeWind`, `lawnWind`), 0 to 1, one value per frame.
+  Garden, 2026-11-11: 16 events; the apples land at 2.283, 4.667 and 6.408 s at 7.4-7.8 m/s (a 2.9 m fall) and
+  bounce once more each.
+- **`scripts/garden_sound.mjs`** (Node, no packages) places one short computed sound per contact at its time, panned
+  by `pan`, scaled by 3 m / distance, and writes a 48 kHz 16-bit stereo WAV of `frames / fps` seconds plus
+  `<out>.cues.json` (time, kind, id). Seeded: two runs give the same file byte for byte. It refuses to write a
+  clipped file.
+- **Measured** (2026-11-11): 384 000 samples = 8.000 s = the clip's 240 frames. Every sound starts within 0.01 ms of
+  its cue (each event rendered alone, first sample above 2 % of its peak). earshot's own onset detector, which knows
+  nothing of the script, puts them 0.3 ms from the cues (`earshot timeline garden_sound.wav --video garden_lens.mp4
+  --cues garden_sound.cues.json`: 14 of 16 cues with an onset within 40 ms, chance 12 %; the other two are the
+  silent dips). A cue itself is as exact as its source: physics samples are 8 ms
+  apart, key frames are exact. Levels: thumps peak at -12 to -15 dBFS, hops near -31, pecks near -35.
+- **What it does not do, said plainly.** earshot (local models, no paid service; never its `llm` commands without
+  Ben's OK) hears the sounds as what they are: the apple thump reads as "a kick drum / a punchy impact hit", hops
+  and pecks as key clicks. Three noise-based thumps read as snare hits instead, so the sine version stayed. Use the
+  file as a timing track and placeholder, not as finished foley.
+- **No wind or leaves in it.** Four synthetic beds (band-passed noise following the gusts, grains, flicker) read as
+  ocean waves, a crackling fire or static, never as leaves (forced choice against "wind in the leaves of a tree":
+  under 1 % each time). That bed has to be a recording; shape its level with `wind.tree` from the events file so it
+  swells with the gusts in the picture. The robin's dips are cues without a sound for the same reason.
+- When checking sync by measurement, render each event alone: with two events 50 ms apart the tail of the first
+  hides the start of the second and the reading comes out as "-50 ms".
+
 ## A reference inside JS: path-trace the same scene
 
 `three-gpu-pathtracer` traces the scene in the same headless Chrome: every bounce, no shadow maps. It is the judge,

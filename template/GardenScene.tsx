@@ -306,6 +306,10 @@ vec3 sway(vec3 p) {              // trees: one smooth field for wood and leaves,
   return vec3(0.9, 0.45, 0.0) * (0.006 * k * a) + vec3(0.0, 0.0, 0.002) * (k * sin(uTime * 2.1 + p.y * 2.0));
 }
 `;
+// The same two wind fields in JS, as a strength from 0 (calm) to 1 (the strongest gust) at one place: what the sound's
+// wind follows (prop events). Keep them in step with the GLSL above.
+const lawnWind = (t: number, p = RABBIT) => (Math.sin((0.9 * p.x + 0.5 * p.y) * 1.1 - t * 1.6) + 0.5 * Math.sin((-0.3 * p.x + p.y) * 2.7 - t * 2.3) + 1.5) / 3;
+const treeWind = (t: number, p = TREE) => (Math.sin(t * 1.3 + p.x * 0.5 + p.y * 0.35) + 0.4 * Math.sin(t * 2.9 + p.x * 1.6 - p.y * 1.1) + 1.4) / 2.8;
 const trans = (fs: string, t: number[]) => fs.replace("#include <lights_physical_pars_fragment>", THREE.ShaderChunk.lights_physical_pars_fragment.replace(
   "vec3 irradiance = dotNL * directLight.color;", `vec3 irradiance = dotNL * directLight.color;
 	reflectedLight.directDiffuse += saturate(-dot(geometryNormal, directLight.direction)) * directLight.color * BRDF_Lambert(material.diffuseContribution * ${v3(t)});`));
@@ -556,7 +560,7 @@ function makeButterfly() {
 }
 
 // ---------------------------------------------------------------- the whole scene
-async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean, scans: boolean, lens: Partial<typeof LENS>) {
+async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean, scans: boolean, lens: Partial<typeof LENS>, events: boolean) {
   PLAIN = plain;
   const LN = PLAIN ? NO_LENS : { ...LENS, ...lens };
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
@@ -886,6 +890,32 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
     return { loc, tgt, roll: hh.roll, lens: CAM[0][3] + (CAM[1][3] - CAM[0][3]) * k, focus: loc.distanceTo(V(RABBIT.x, RABBIT.y, 0.12)) };
   }
 
+  // ---------------------------------------------------------------- sound: everything audible, as numbers (prop events)
+  // A sound made for this clip has to hit its frames, so it is built from the data the picture is drawn from: the stored
+  // physics (a jump in a body's downward speed is a contact), the key tables and the wind formulas. Each contact gets
+  // its time, speed, place on screen (pan -1 left .. 1 right) and distance. scripts/garden_sound.mjs turns this into a WAV.
+  if (events) {
+    const pc = new THREE.PerspectiveCamera(50, W / H, 0.1, 3000), hits: { t: number }[] = [];
+    const hit = (kind: string, id: string, t: number, p: V3, v = 0) => {
+      const c = update(t * 30);
+      pc.position.copy(b2t(c.loc)); pc.up.set(0, 1, 0); pc.lookAt(b2t(c.tgt)); pc.fov = (2 * Math.atan(12 / c.lens) * 180) / Math.PI; pc.updateProjectionMatrix(); pc.updateMatrixWorld();
+      hits.push({ t: +t.toFixed(4), kind, id, v: +v.toFixed(2), pan: +b2t(p).project(pc).x.toFixed(3), dist: +p.distanceTo(c.loc).toFixed(2) } as { t: number });
+    };
+    drop.forEach((a, i) => {                                          // apples: every bounce
+      const d = tracks[2 + i].d, z = (n: number) => d[n * 7 + 2];
+      for (let n = 1, last = -99; n < d.length / 7 - 1; n++) {
+        const v0 = (z(n) - z(n - 1)) * HZ, v1 = (z(n + 1) - z(n)) * HZ;   // vertical speed into and out of sample n
+        if (v0 < -0.3 && v1 - v0 > 0.5 && n - last > HZ / 20) { hit("apple", `apple ${i + 1}`, n / HZ, V(d[n * 7], d[n * 7 + 1], z(n)), -v0); last = n; }
+      }
+    });
+    const first = (keys: Key[], at: number) => keys.filter((k, i) => k[1][at] >= 50 && (i === 0 || keys[i - 1][1][at] < 50)).map((k) => k[0]);   // frames where a bird's body tips down
+    HOPS.forEach((h, i) => { update(h + 5); const p = blackbird.g.position.clone(); hit(p.x > -0.63 ? "hop stone" : "hop", `blackbird hop ${i + 1}`, (h + 5) / 30, p); });
+    first(BB, 0).forEach((f, i) => { update(f); hit("peck", `blackbird peck ${i + 1}`, f / 30, blackbird.g.position.clone()); });
+    first(RB, 0).forEach((f, i) => { update(f); hit("dip", `robin dip ${i + 1}`, f / 30, robin.g.position.clone()); });
+    const fr = [...Array(FRAMES + 1).keys()];
+    throw new Error("EVENTS " + JSON.stringify({ fps: 30, frames: FRAMES, wind: { tree: fr.map((f) => +treeWind(f / 30).toFixed(3)), lawn: fr.map((f) => +lawnWind(f / 30).toFixed(3)) }, hits: hits.sort((a, b) => a.t - b.t) }));
+  }
+
   // render targets: one pass, the running mean, a small copy for the glow; then Blender's view transform
   const rtMain = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType });
   const rtAcc = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, depthBuffer: false });
@@ -1021,14 +1051,15 @@ void main() {
 /** passes: samples of our renderer. sky: a photo in public/js3d (see photoSky), "" = painted. scans: scanned bark,
  * wood, stone and leaf shapes from public/js3d instead of the generated ones. plain: our renderer without
  * its tricks. pt: path-trace the plain scene with this many samples instead (reference only; needs a photo sky).
- * lens: any of LENS's numbers, to try one without editing the file (--props='{"lens":{"blades":5}}'). */
-export const Js3dGarden: React.FC<{ passes?: number; sky?: string; scans?: boolean; plain?: boolean; pt?: number; lens?: Partial<typeof LENS> }> = ({ passes = 32, sky = "", scans = false, plain = false, pt = 0, lens = {} }) => {
+ * lens: any of LENS's numbers, to try one without editing the file (--props='{"lens":{"blades":5}}').
+ * events: render nothing; stop with "EVENTS {json}", the scene's audible events and wind for scripts/garden_sound.mjs. */
+export const Js3dGarden: React.FC<{ passes?: number; sky?: string; scans?: boolean; plain?: boolean; pt?: number; lens?: Partial<typeof LENS>; events?: boolean }> = ({ passes = 32, sky = "", scans = false, plain = false, pt = 0, lens = {}, events = false }) => {
   const frame = useCurrentFrame();
   const canvas = useRef<HTMLCanvasElement>(null);
   const ctx = useRef<Promise<(fr: number, passes: number, pt?: number) => Promise<void>> | null>(null);
   useLayoutEffect(() => {
     const h = delayRender(`garden frame ${frame}`);
-    ctx.current ??= build(canvas.current!, sky, plain || pt > 0, scans, lens);
+    ctx.current ??= build(canvas.current!, sky, plain || pt > 0, scans, lens, events);
     ctx.current.then((render) => render(frame, passes, pt)).then(() => continueRender(h)).catch((e) => cancelRender(e));
   }, [frame, passes, pt]);
   return (
