@@ -32,6 +32,12 @@ The Remotion project `~/claude-code/animations` already has three.js and renders
 mkdir -p ~/claude-code/animations/public/js3d && cp ~/.claude/skills/js3d-broll/assets/agx_mhc_65.bin ~/claude-code/animations/public/js3d/
 ```
 
+For outdoor scenes, a sky photo (23.8 MB, CC0; ask Ben before downloading, others are listed at polyhaven.com/hdris):
+
+```bash
+curl -L -o ~/claude-code/animations/public/js3d/spruit_sunrise_4k.hdr https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/4k/spruit_sunrise_4k.hdr
+```
+
 Without that project (any other machine), make one; the paths below then start at its folder instead:
 
 ```bash
@@ -71,13 +77,27 @@ single points with `b2t()` for things outside `root` (camera, area lights). Lens
 
 ## Outdoor scenes: what GardenScene.tsx adds
 
-Engine (keep): `skyRad` + dome + `aim()` and the sun/sky block in the pass loop, `patch`, `Scatter`, `trans`, `fur`,
+Engine (keep): `photoSky` / `paintedSky` + dome + `aim()` and the sun/sky block in the pass loop, `patch`, `Scatter`, `trans`, `fur`,
 `tex`, `ribbon`, `limb`, `loft`, `paint`, the haze sheets, the glow/vignette/grain output. Scene (replace): the
 layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
 
+- **Light it with a photographed sky** (prop `sky`, `photoSky(name, azimuth)`). An unclipped HDRI panorama
+  (polyhaven.com, CC0, `public/js3d/<name>_4k.hdr`) is read as numbers, not just shown. The brightest spot and
+  everything within 2.5 deg of it becomes the sun light: direction, colour and strength measured from the photo.
+  The rest of the upper half is cut into 64 x 256 cells, and each pass picks one cell in proportion to its light, so
+  every sample stands for the same amount and bright sky gets more samples. Sun against sky, and both colours, are
+  then a real place's: warm sun, blue shade, which the painted gradient had wrong (2026-11-11, three photos side by
+  side with the painted sky). `light` (2.6 on level ground) is the exposure. Checked: 32 samples add up to the sky's
+  light on level ground within 3 % of the exact sum (8 samples: 7 %, 2048: 0.4 %), same on all three photos.
+  Load as FloatType: the sun in these files reaches 68 000-254 000 and half floats stop at 65 504.
+  `scripts/hdri_stats.mjs` prints a photo's sun height, sun share and colours (run it inside the Remotion project).
+  `sky: ""` falls back to `paintedSky()` (no file needed, every direction equally likely, `skyRad`). Set the photo in
+  the composition's `defaultProps` (`{ passes: 32, sky: "spruit_sunrise" }`, Ben's pick of three for the garden).
+- **Sunset photos have a very low sun** (8-12 deg in the three tested; a 1.5 m fence throws 10 m). `SUN_AZ` turns the
+  photo so its sun comes in where nothing blocks it: 70 deg (from the right) for the garden.
 - **Sky light with real occlusion.** Besides the sun, every pass adds ONE more shadow-casting directional light from
-  a sky direction (R2 sequence over the hemisphere, height 0.1..1), coloured `skyRad(direction)`, intensity
-  `2 pi * 0.9`. The mean of the passes is the integral over the sky, and because each sample has its own shadow map
+  a sky direction (`sky.pick(i)`), coloured by the sky there.
+  The mean of the passes is the integral over the sky, and because each sample has its own shadow map
   the result is darker under bushes, between blades and under an animal: ambient occlusion that is measured, not
   faked. A HemisphereLight with a black sky colour adds only the lawn's bounce from below. No environment map on
   diffuse materials (it would count the sky twice); the PMREM of the dome goes on glossy things only (eyes, water).
@@ -106,7 +126,7 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
   (the first attempt) gives a candelabra.
 - **Haze and light shafts**: 28 camera-facing sheets of additive Lambert "air" whose normal is forced to the sun and
   which receive shadows. Summed, the air is lit except in the crown's shadow. Their depths shift every pass.
-- **Look**: the dome is drawn 0.62x darker than it lights (a white sky otherwise); glow = 8 % of the frame's own mip
+- **Look**: the painted dome is drawn 0.62x darker than it lights (a white sky otherwise), a photo as it is; glow = 8 % of the frame's own mip
   chain; vignette; 1.4 % grain seeded by the frame number; FogExp2 for the far distance.
 
 ## Measured facts (do not re-derive)

@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { FullScreenQuad } from "three/examples/jsm/postprocessing/Pass.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
+import { HDRLoader } from "three/examples/jsm/loaders/HDRLoader.js";
 import { AbsoluteFill, cancelRender, continueRender, delayRender, staticFile, useCurrentFrame } from "remotion";
 
 // js3d-broll, outdoor worked example: a garden at golden hour, built from nothing (no Blender original, no assets).
@@ -50,12 +51,13 @@ const halton = (i: number, b: number) => { let f = 1, r = 0; while (i > 0) { f /
 const QUAD_VS = "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }";
 
 // ---------------------------------------------------------------- layout (metres, camera looks along +Y)
-const SUN = V(0.55, 0.75, 0.38).normalize();        // direction to the sun: behind the tree, to the right, 22 deg up
+const SUN = V(0.55, 0.75, 0.38).normalize();        // painted sky: direction to the sun (behind the tree, to the right, 22 deg up)
+const SUN_AZ = 70;                                   // photo sky: where its sun is turned to (deg right of straight ahead)
 const TREE = V(-0.6, 1.8, 0), RABBIT = V(0.25, -1.5, 0), BATH = V(0.85, -0.1, 0);
 const STONES = [[-0.85, -3.3, 0.3], [-0.72, -2.65, 0.26], [-0.44, -2.05, 0.27], [-0.62, -1.35, 0.25], [-0.34, -0.7, 0.28], [0.1, -0.15, 0.24]];
 const BUSHES = [[-1.9, 4.9, 0.95, 0.75, 0.9], [1.75, 3.7, 0.75, 0.7, 0.7], [0.25, 5.25, 0.45, 0.45, 0.42]];   // x, y, rx, ry, rz
 const HEDGE = [[-5.6, 7.9, 2.5], [-3.3, 8.3, 3.0], [-1.0, 7.8, 2.3], [1.2, 8.4, 2.8], [3.5, 7.9, 2.4], [5.8, 8.2, 2.9]];   // x, y, height
-const FENCE_Y = 6.0, HAZE = 0.012;                      // HAZE: how much sunlight a sheet of air (0.5 m) throws back
+const FENCE_Y = 6.0, HAZE = 0.008;                      // HAZE: how much sunlight a sheet of air (0.5 m) throws back
 const gz = (x: number, y: number) => 0.05 * PN.noise(x * 0.35 + 3.1, y * 0.35, 0.5) + 0.012 * PN.noise(x * 1.9, y * 1.9 + 7.7, 0.5);
 const G = (x: number, y: number, z = 0) => V(x, y, gz(x, y) + z);
 const HOR = [0.54, 0.41, 0.28], ZEN = [0.08, 0.17, 0.42];
@@ -79,6 +81,67 @@ void main() {
   c = mix(c, vec3(0.34, 0.30, 0.33) + vec3(1.5, 0.85, 0.5) * (0.25 + 1.6 * pow(mu, 2.0)), 0.75 * cl);   // clouds: grey bodies, lit warm towards the sun
   gl_FragColor = vec4(d.z < 0.0 ? vec3(0.03, 0.04, 0.015) : c * 0.62, 1.0);   // seen a stop darker than it lights (a graduated filter): colour instead of white
 }`;
+
+/** Where the light comes from. sun: its direction, sunCol: its light on a surface facing it. pick(i): the sky direction
+ * of pass i and the light that one sample stands for. fog: what distance fades to. ground: the lawn's bounce from
+ * below. dome: what the camera sees behind everything. */
+type Sky = { sun: V3; sunCol: number[]; fog: number[]; ground: number[]; dome: THREE.Material; pick: (i: number) => { d: V3; c: number[] } };
+const DOME_VS = "varying vec3 vD; void main() { vD = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }";
+const r2 = (i: number) => [((i + 0.5) * 0.7548776662) % 1, ((i + 0.5) * 0.5698402910) % 1];   // points spread evenly over a square
+function paintedSky(): Sky {                         // no file needed: the gradient above, every direction equally likely
+  return { sun: SUN, sunCol: [6.0, 4.32, 2.76], fog: [0.9, 0.62, 0.38], ground: [0.26, 0.32, 0.11],
+    dome: new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false, fog: false, vertexShader: DOME_VS, fragmentShader: SKY_FS }),
+    pick: (i) => { const [u, v] = r2(i), z = 0.1 + 0.9 * u, q = Math.sqrt(1 - z * z), d = V(q * Math.cos(TAU * v), q * Math.sin(TAU * v), z); return { d, c: skyRad(d).map((x) => x * TAU * 0.9) }; } };
+}
+/** A photographed sky (an unclipped HDRI panorama in public/js3d/<name>_4k.hdr, e.g. from polyhaven.com, CC0). The
+ * brightest spot is the sun: everything within 2.5 deg of it becomes the sun light, with the photo's own colour and
+ * strength against the sky. The rest is cut into 64 x 256 cells; a pass picks one in proportion to its light, so every
+ * sample stands for the same amount and bright sky gets more of them. az turns the photo: its sun to that azimuth
+ * (deg, 0 = straight ahead, 90 = right). light = what level ground receives, i.e. the exposure. */
+async function photoSky(name: string, az: number, light = 2.6): Promise<Sky> {
+  const t = await new HDRLoader().setDataType(THREE.FloatType).loadAsync(staticFile(`js3d/${name}_4k.hdr`));
+  const { width: w, height: h, data: D } = t.image as unknown as { width: number; height: number; data: Float32Array }, h2 = h / 2;
+  const lum = (c: ArrayLike<number>, k = 0) => 0.2126 * c[k] + 0.7152 * c[k + 1] + 0.0722 * c[k + 2];
+  let max = 0, mi = 0, mj = 0;
+  for (let j = 0; j < h2; j++) for (let i = 0; i < w; i++) { const y = lum(D, (j * w + i) * 4); if (y > max) { max = y; mi = i; mj = j; } }
+  const el = (j: number) => Math.PI / 2 - (Math.PI * (j + 0.5)) / h, rot = rad(az) - ((TAU * (mi + 0.5)) / w - Math.PI);
+  const sinP = Float64Array.from({ length: w }, (_, i) => Math.sin((TAU * (i + 0.5)) / w - Math.PI + rot)), cosP = Float64Array.from({ length: w }, (_, i) => Math.cos((TAU * (i + 0.5)) / w - Math.PI + rot));
+  const s0 = [Math.cos(el(mj)) * sinP[mi], Math.cos(el(mj)) * cosP[mi], Math.sin(el(mj))], cosR = Math.cos(rad(2.5));
+  const CH = 64, CW = 256, bh = h2 / CH, bw = w / CW, cell = new Float64Array(CH * CW * 3);
+  const sunE = [0, 0, 0], sd = [0, 0, 0], skyE = [0, 0, 0], low = [0, 0, 0];
+  let lowW = 0;
+  for (let j = 0; j < h2; j++) {                                     // upper half only: below the horizon is our own ground
+    const e = el(j), ce = Math.cos(e), se = Math.sin(e), dw = ce * (Math.PI / h) * (TAU / w), cj = Math.floor(j / bh) * CW;
+    for (let i = 0; i < w; i++) {
+      const k = (j * w + i) * 4, dx = ce * sinP[i], dy = ce * cosP[i];
+      if (dx * s0[0] + dy * s0[1] + se * s0[2] > cosR) {
+        const y = lum(D, k) * dw; sd[0] += dx * y; sd[1] += dy * y; sd[2] += se * y;
+        for (let c = 0; c < 3; c++) sunE[c] += D[k + c] * dw;
+      } else {
+        const q = (cj + Math.floor(i / bw)) * 3;
+        for (let c = 0; c < 3; c++) { const v = D[k + c] * dw; cell[q + c] += v; skyE[c] += v * se; if (e < 0.26) low[c] += v; }
+        if (e < 0.26) lowW += dw;
+      }
+    }
+  }
+  const sun = V(sd[0], sd[1], sd[2]).normalize(), k = light / (lum(skyE) + lum(sunE) * sun.z);
+  const rowSum = new Float64Array(CH), cy = new Float64Array(CH * CW);
+  let total = 0;
+  for (let q = 0; q < CH * CW; q++) { cy[q] = lum(cell, q * 3); rowSum[Math.floor(q / CW)] += cy[q]; total += cy[q]; }
+  const pick = (i: number) => {
+    const [u, v] = r2(i);
+    let r = 0, a = u * total; while (r < CH - 1 && a > rowSum[r]) a -= rowSum[r++];
+    let c = 0, b = v * rowSum[r]; while (c < CW - 1 && b > cy[r * CW + c]) b -= cy[r * CW + c++];
+    const q = r * CW + c, e = Math.max(el((r + 0.5) * bh - 0.5), 0.05), ph = (TAU * (c + 0.5)) / CW - Math.PI + rot;
+    return { d: V(Math.cos(e) * Math.sin(ph), Math.cos(e) * Math.cos(ph), Math.sin(e)), c: [0, 1, 2].map((m) => (cell[q * 3 + m] / Math.max(cy[q], 1e-12)) * total * k) };
+  };
+  t.wrapS = THREE.RepeatWrapping;
+  const dome = new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false, fog: false, uniforms: { tSky: { value: t } }, vertexShader: DOME_VS,
+    fragmentShader: `uniform sampler2D tSky; varying vec3 vD; void main() { vec3 d = normalize(vD);
+  vec2 uv = vec2((atan(d.x, d.y) - ${fl(rot)}) / 6.2831853 + 0.5, 0.5 + asin(d.z) / 3.1415927);
+  gl_FragColor = vec4(min(textureLod(tSky, uv, 0.0).rgb * ${fl(k)}, vec3(60.0)), 1.0); }` });   // capped: the sun's own disk is the sun light's job
+  return { sun, sunCol: sunE.map((x) => x * k), fog: low.map((x) => (x / lowW) * k), ground: [0.085, 0.105, 0.036].map((a, c) => a * (skyE[c] + sunE[c] * sun.z) * k), dome, pick };
+}
 
 // ---------------------------------------------------------------- geometry
 function ring(c: V3, u: V3, v: V3, ru: number, rv: number, n = 20, p = 2.0): V3[] {
@@ -418,7 +481,7 @@ function makeButterfly() {
 }
 
 // ---------------------------------------------------------------- the whole scene
-async function build(canvas: HTMLCanvasElement) {
+async function build(canvas: HTMLCanvasElement, skyName: string) {
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(1); renderer.setSize(W, H, false);
   renderer.autoClear = false;
@@ -432,15 +495,15 @@ async function build(canvas: HTMLCanvasElement) {
   lut.type = THREE.HalfFloatType; lut.format = THREE.RGBAFormat; lut.unpackAlignment = 1;
   lut.minFilter = lut.magFilter = THREE.LinearFilter; lut.wrapS = lut.wrapT = lut.wrapR = THREE.ClampToEdgeWrapping; lut.needsUpdate = true;
 
+  const sky = skyName ? await photoSky(skyName, SUN_AZ) : paintedSky();
   const scene = new THREE.Scene();
-  scene.fog = new THREE.FogExp2(col([0.9, 0.62, 0.38]), 0.018);     // evening haze: far things go warm and pale
+  scene.fog = new THREE.FogExp2(col(sky.fog), 0.018);               // haze: far things fade to the low sky's colour
   const root = new THREE.Group(); root.rotation.x = -Math.PI / 2; scene.add(root);   // Blender Z up -> three Y up
   const put = (g: THREE.BufferGeometry, m: THREE.Material, parent: THREE.Object3D = root) => { const o = new THREE.Mesh(g, m); o.castShadow = o.receiveShadow = true; parent.add(o); return o; };
 
-  // sky: a dome to look at, an environment for the few glossy things, and the function skyRad for the light
+  // sky: a dome to look at and an environment for the few glossy things (the light itself comes from sky.pick)
   const skyG = new THREE.Group(); skyG.rotation.x = -Math.PI / 2;
-  const dome = new THREE.Mesh(new THREE.SphereGeometry(900, 48, 24), new THREE.ShaderMaterial({ side: THREE.BackSide, depthWrite: false, fog: false,
-    vertexShader: "varying vec3 vD; void main() { vD = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }", fragmentShader: SKY_FS }));
+  const dome = new THREE.Mesh(new THREE.SphereGeometry(900, 48, 24), sky.dome);
   dome.frustumCulled = false; skyG.add(dome);
   const envScene = new THREE.Scene(); envScene.add(skyG);
   const pmrem = new THREE.PMREMGenerator(renderer);
@@ -448,12 +511,12 @@ async function build(canvas: HTMLCanvasElement) {
   pmrem.dispose(); scene.add(skyG);
   const eye = new THREE.MeshPhysicalMaterial({ color: col([0.012, 0.008, 0.006]), roughness: 0.06, envMap: env, clearcoat: 1 });
 
-  // lights. Units: sun 6 on a surface facing it (white comes out at 1.9), the sky from skyRad, the lawn's own bounce from below
-  const sun = new THREE.DirectionalLight(col([1.0, 0.72, 0.46]), 6.0), skyL = new THREE.DirectionalLight(0xffffff, TAU * 0.9);
+  // lights: the sun, one sky sample per pass (colour set in the pass loop), the lawn's own bounce from below
+  const sun = new THREE.DirectionalLight(col(sky.sunCol), 1), skyL = new THREE.DirectionalLight(0xffffff, 1);
   for (const [l, n] of [[sun, 8192], [skyL, 4096]] as const) {
     l.castShadow = true; l.shadow.mapSize.set(n, n); l.shadow.bias = -0.0004; l.shadow.normalBias = 0.012; scene.add(l, l.target);
   }
-  scene.add(new THREE.HemisphereLight(0x000000, col([0.26, 0.32, 0.11]), 1.0));
+  scene.add(new THREE.HemisphereLight(0x000000, col(sky.ground), 1.0));
   const CEN = b2t(V(0, 3, 3)), CORNERS = Array.from({ length: 8 }, (_, i) => b2t(V(i & 1 ? 6.5 : -6.5, i & 2 ? 12.5 : -6, i & 4 ? 6.5 : -0.3)));
   function aim(l: THREE.DirectionalLight, d: V3) {                 // point a light and fit its shadow map around the garden
     l.position.copy(CEN).addScaledVector(b2t(d), 40); l.target.position.copy(CEN);
@@ -697,7 +760,7 @@ void main() {
       .replace("#include <defaultnormal_vertex>", "vec3 transformedNormal = uSunV;");
   };
   const haze = new THREE.Mesh(hazeG, hazeM); haze.frustumCulled = false; haze.receiveShadow = true; haze.renderOrder = 10; cam.add(haze);
-  const su = SUN.clone().cross(Z).normalize(), sv = SUN.clone().cross(su);
+  const su = sky.sun.clone().cross(Z).normalize(), sv = sky.sun.clone().cross(su);
   return function render(fr: number, passes: number) {
     renderer.setRenderTarget(rtAcc); renderer.setClearColor(0x000000, 0); renderer.clear();
     for (let i = 0; i < passes; i++) {
@@ -712,12 +775,11 @@ void main() {
       cam.updateMatrixWorld();
       const ty = Math.tan(rad(cam.fov) / 2) * 1.02;
       hzU.value.set(1.5 + 0.5 * hs(13), 0.5, ty * (W / H), ty);     // first sheet, spacing, half width and height per metre of depth
-      sunVU.value.copy(b2t(SUN)).transformDirection(cam.matrixWorldInverse);
+      sunVU.value.copy(b2t(sky.sun)).transformDirection(cam.matrixWorldInverse);
       const sr = 0.012 * Math.sqrt((i + 0.5) / passes), sa = TAU * ((i * 0.6180339887) % 1);        // a point on the sun's (widened) disk
-      aim(sun, SUN.clone().addScaledVector(su, sr * Math.cos(sa)).addScaledVector(sv, sr * Math.sin(sa)).normalize());
-      const z = 0.1 + 0.9 * (((i + 0.5) * 0.7548776662) % 1), a = TAU * (((i + 0.5) * 0.5698402910) % 1), q = Math.sqrt(1 - z * z);   // one sky direction
-      const sd = V(q * Math.cos(a), q * Math.sin(a), z), sc = skyRad(sd);
-      aim(skyL, sd); skyL.color.setRGB(sc[0], sc[1], sc[2]);
+      aim(sun, sky.sun.clone().addScaledVector(su, sr * Math.cos(sa)).addScaledVector(sv, sr * Math.sin(sa)).normalize());
+      const sk = sky.pick(i);                                       // one sky direction and the light it stands for
+      aim(skyL, sk.d); skyL.color.setRGB(sk.c[0], sk.c[1], sk.c[2]);
       renderer.shadowMap.needsUpdate = true;
       scene.updateMatrixWorld();
       renderer.setRenderTarget(rtMain); renderer.setClearColor(0x000000, 1); renderer.clear(); renderer.render(scene, cam);
@@ -730,13 +792,13 @@ void main() {
   };
 }
 
-export const Js3dGarden: React.FC<{ passes?: number }> = ({ passes = 32 }) => {
+export const Js3dGarden: React.FC<{ passes?: number; sky?: string }> = ({ passes = 32, sky = "" }) => {
   const frame = useCurrentFrame();
   const canvas = useRef<HTMLCanvasElement>(null);
   const ctx = useRef<Promise<(fr: number, passes: number) => void> | null>(null);
   useLayoutEffect(() => {
     const h = delayRender(`garden frame ${frame}`);
-    ctx.current ??= build(canvas.current!);
+    ctx.current ??= build(canvas.current!, sky);
     ctx.current.then((render) => { render(frame, passes); continueRender(h); }).catch((e) => cancelRender(e));
   }, [frame, passes]);
   return (
