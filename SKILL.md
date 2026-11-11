@@ -89,7 +89,7 @@ single points with `b2t()` for things outside `root` (camera, area lights). Lens
 ## Outdoor scenes: what GardenScene.tsx adds
 
 Engine (keep): `photoSky` / `paintedSky` + dome + `aim()` and the sun/sky block in the pass loop, `patch`, `Scatter`, `trans`, `fur`,
-`tex`, `ribbon`, `limb`, `loft`, `paint`, the haze sheets, the glow/vignette/grain output. Scene (replace): the
+`tex`, `ribbon`, `limb`, `loft`, `paint`, the haze sheets, the lens (`LENS`, `aperture`, `handheld`, the output shader). Scene (replace): the
 layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
 
 - **Light it with a photographed sky** (prop `sky`, `photoSky(name, azimuth)`). An unclipped HDRI panorama
@@ -164,7 +164,69 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
 - **Haze and light shafts**: 28 camera-facing sheets of additive Lambert "air" whose normal is forced to the sun and
   which receive shadows. Summed, the air is lit except in the crown's shadow. Their depths shift every pass.
 - **Look**: the painted dome is drawn 0.62x darker than it lights (a white sky otherwise), a photo as it is; glow = 8 % of the frame's own mip
-  chain; vignette; 1.4 % grain seeded by the frame number; FogExp2 for the far distance.
+  chain; FogExp2 for the far distance. Corner darkening and noise are the lens's (next section).
+
+## The lens (GardenScene.tsx)
+
+An ideal thin lens and a clean sensor are the last things that say "render". `LENS` at the top of the file holds
+one number per flaw of a real camera, 0 = off; `plain` and `pt` run with all of them off. Try a value without
+editing the file: `--props='{"passes":32,"sky":"spruit_sunrise","scans":true,"lens":{"fringe":4}}'`.
+
+`LENS = { fstop: 2, blades: 7, squeeze: 1, distort: 0.02, fringe: 1, noise: 0.02, falloff: 1, shake: 1 }` was picked
+2026-11-11 from labelled variants on the restrained side: a good real lens, not an effect. The clip with it is
+`out/garden_lens.mp4` (240 frames in 6 min 46 s against 6 min 38 s for the clip before: the lens costs next to nothing).
+
+- **Aperture shape** (`aperture(u, v, blades, squeeze)`, in the pass loop). The lens point of a pass is drawn from a
+  polygon instead of a disk: the polygon is `blades` triangles around the centre, `v` picks a triangle and a place
+  along its outer edge, `sqrt(u)` the way out, which spreads the points evenly. `squeeze` scales the aperture's width
+  (0.5 = an anamorphic lens's tall oval). Checked: 20 000 points, none outside the heptagon, centroid 0.0000.
+- **Barrel distortion and colour fringing** (output shader). The finished frame is read back at
+  `q * (1 + distort * r2) / (1 + distort)`, r2 = 0 in the middle and 1 in the corners: the corners keep their place
+  and the middle grows by `distort`, so no border has to be invented. Red is read `fringe` pixels further out at the
+  corners and blue as far in, green stays (lateral chromatic aberration).
+- **Natural fall-off** replaces the hand-set vignette: `cos^4` of each pixel's angle off the lens axis, from the real
+  focal length (`uTan`). At 27 mm on the 24 mm tall sensor that is 0.70 at the top edge and 0.63 in the corners (the
+  old vignette: 0.875 and 0.75).
+- **Sensor noise** replaces the grain. It is added in linear light before the LUT, per colour channel, with a spread
+  of `noise * sqrt(0.18 * c)`: photons arrive at random, so the spread grows with the root of the light, and `noise`
+  is its share of the signal at mid grey. On screen it therefore comes out like a camera's, strongest in the dark
+  and fading in the highlights (measured at 4 %, sd of noisy minus clean in G/255: 2.4-2.7 below 128, 1.2 at 160-191,
+  0.8 above 192; fence 2.6, sky 1.2; at the default 2 %: fence 1.4, sky 0.7). The old grain was 1.0 everywhere.
+  Seeded by the frame number.
+- **Handheld** (`handheld(t, shake)`, added to the camera in `update`). Position, aim and roll each get a slow sway
+  (two sines under 0.6 Hz) plus a tremor at 5 % of it (2-5 Hz), all with unrelated periods. It is a pure function of
+  time, so frames stay order-independent and every pass's sub-frame time blurs it. Measured from the scene with a
+  probe (project a near and a far point through the camera for all 240 frames, with `shake` 1 and 0): the picture
+  wanders +-13 px (1.2 % of the width), at most 1.2 px per frame for a far point, and that speed changes by at most
+  0.44 px from one frame to the next; roll -0.12 to +0.37 deg; the camera itself moves +-6 mm. For comparison the
+  steady camera path alone moves the rabbit 0.5 px per frame.
+
+What the test frames showed (frame 150, each flaw alone against the same frame without it):
+
+- **The blade count cannot be seen at f/2 in this shot.** The background blur is at most ~10 px across and a pass
+  is one sharp copy, so 32 points on a disk, a heptagon or a pentagon look the same. Control: at `fstop` 0.5 and 256
+  passes the midges in the sun turn into clean disks, pentagons or tall ovals, so the sampling is right. Blades are
+  worth choosing only when the blur is tens of pixels wide and there are small bright things in it. The oval does
+  show at f/2: half the sideways blur (the foreground grass is visibly sharper across).
+- Do not judge the aperture shape by a difference picture: another shape moves all 32 lens points, and that alone
+  changes the frame by 2.4/255 on average.
+- Distortion is almost invisible in a scene without straight lines near the edges; at these strengths it reads as
+  the middle being a little larger.
+- **Reading the frame back between its pixels costs sharpness, whatever the strength.** With the GPU's bilinear
+  filter 2 % distortion took 28 % of the fine detail (mean edge strength on the rabbit and grass, native pixels:
+  34.2 -> 24.6; 8 % distortion: 23.9, so it is the resampling, not the amount), and 2 px fringing took 13 %. The
+  output shader therefore reads through a 4 x 4 Catmull-Rom curve (`sharp()`): 29.7 with 2 % distortion, 29.3 with
+  the defaults, and with distortion and fringing at 0 the frame is the old one to 1/255. The 13 % that is left is
+  the price of any distortion at 1080 px; set `distort` and `fringe` to 0 when a shot needs every pixel.
+- Fringing shows only where a dark edge meets the sky near a corner: 1 px is hard to find, 2 px is there when you
+  look for it, 4 px reads as a cheap lens.
+- Keep the tremor under ~5 Hz. The first version had it at 4-9 Hz: at 30 fps the picture then stepped 1.6 px, 0.3 px,
+  1.6 px on alternate frames (speed changing by 1.4 px between frames), which is judder, not a hand. Found by
+  probing the path, confirmed in a rendered clip (largest step in the frame-to-frame difference 2.35 against 0.85
+  after the change). Judge handheld motion from the probed path and a clip, never from a still.
+- A full clip check after any camera change: 240 frames, no audio track, no magenta frame, and the frame-to-frame
+  difference at quarter size without an outlier (here max / median 1.40, and it follows the probed camera speed,
+  r = 0.83).
 
 ## A reference inside JS: path-trace the same scene
 

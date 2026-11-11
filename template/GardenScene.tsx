@@ -273,6 +273,28 @@ const timeU = { value: 0 };
 // shaders; our own renderer can render the same thing (prop plain), and the difference between the two is then light
 // transport alone.
 let PLAIN = false;
+
+// ---------------------------------------------------------------- the lens: a real one's flaws, each with its own number (0 = off)
+// fstop: focal length / aperture width (2 = f/2). blades: aperture blades, 0 = a round hole. squeeze: aperture width / height (1 round, 0.5 = the tall oval of an
+// anamorphic lens). distort: barrel, how far the corners are pulled in (0.03 = 3 %). fringe: red/blue apart at the
+// corners, pixels. noise: sensor noise at mid grey as a share of the signal (0.03 = 3 %). falloff: 1 = the corners
+// darken by cos^4 of their angle off the axis. shake: 1 = a camera held in two hands. PLAIN and pt run with all off.
+const LENS = { fstop: 2, blades: 7, squeeze: 1, distort: 0.02, fringe: 1, noise: 0.02, falloff: 1, shake: 1 };
+const NO_LENS: typeof LENS = { fstop: 2, blades: 0, squeeze: 1, distort: 0, fringe: 0, noise: 0, falloff: 0, shake: 0 };
+/** A point on the aperture (x, y within -1..1) from two random numbers: a disk, or a polygon of n blades. The polygon
+ * is n triangles around the centre; v picks one and a place along its outer edge, sqrt(u) the way out: evenly spread. */
+function aperture(u: number, v: number, n: number, squeeze: number) {
+  const r = Math.sqrt(u), k = Math.floor(v * n), f = v * n - k, a0 = n ? (TAU * k) / n + 0.3 : TAU * v, a1 = n ? a0 + TAU / n : a0;
+  return [squeeze * r * ((1 - f) * Math.cos(a0) + f * Math.cos(a1)), r * ((1 - f) * Math.sin(a0) + f * Math.sin(a1))];
+}
+/** A held camera at time t (s): metres off its path, radians off its aim. Each axis is a slow sway (breathing, weight
+ * shifting, under 0.6 Hz) plus a faint tremor (2-5 Hz; faster would judder at 30 fps), all sines with unrelated periods: smooth, never repeating
+ * within a clip, and a pure function of time, so a frame's passes blur it like any other motion. */
+function handheld(t: number, k: number) {
+  const w = (f1: number, f2: number, f3: number, p: number) => k * (Math.sin(TAU * f1 * t + p) + 0.5 * Math.sin(TAU * f2 * t + 2.3 * p) + 0.05 * Math.sin(TAU * f3 * t + 4.1 * p));
+  return { x: 0.004 * w(0.13, 0.31, 2.9, 1), y: 0.003 * w(0.11, 0.37, 3.4, 2), z: 0.004 * w(0.17, 0.29, 3.9, 3),
+    yaw: rad(0.22) * w(0.19, 0.43, 4.3, 4), pitch: rad(0.18) * w(0.23, 0.53, 4.7, 5), roll: rad(0.25) * w(0.09, 0.27, 2.3, 6) };
+}
 const WIND = `uniform float uTime;
 vec3 qrot(vec4 q, vec3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
 vec2 gust(vec2 p, float r) {     // lawn: waves travelling with the wind + each blade's own shiver
@@ -534,8 +556,9 @@ function makeButterfly() {
 }
 
 // ---------------------------------------------------------------- the whole scene
-async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean, scans: boolean) {
+async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean, scans: boolean, lens: Partial<typeof LENS>) {
   PLAIN = plain;
+  const LN = PLAIN ? NO_LENS : { ...LENS, ...lens };
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(1); renderer.setSize(W, H, false);
   renderer.autoClear = false;
@@ -857,8 +880,10 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
       o.visible = fr >= f0;
     }
     const k = fr / (FRAMES - 1), L = (a: number[], b: number[]) => V(a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k);
-    const loc = L(CAM[0][1], CAM[1][1]);
-    return { loc, tgt: L(CAM[0][2], CAM[1][2]), lens: CAM[0][3] + (CAM[1][3] - CAM[0][3]) * k, focus: loc.distanceTo(V(RABBIT.x, RABBIT.y, 0.12)) };
+    const hh = handheld(t, LN.shake), loc = L(CAM[0][1], CAM[1][1]).add(V(hh.x, hh.y, hh.z)), tgt = L(CAM[0][2], CAM[1][2]);
+    const d = tgt.distanceTo(loc), fw = tgt.clone().sub(loc).normalize(), rt = fw.clone().cross(Z).normalize();
+    tgt.addScaledVector(rt, d * hh.yaw).addScaledVector(rt.clone().cross(fw), d * hh.pitch);   // the aim wanders with the hands
+    return { loc, tgt, roll: hh.roll, lens: CAM[0][3] + (CAM[1][3] - CAM[0][3]) * k, focus: loc.distanceTo(V(RABBIT.x, RABBIT.y, 0.12)) };
   }
 
   // render targets: one pass, the running mean, a small copy for the glow; then Blender's view transform
@@ -870,19 +895,34 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean,
     blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, depthTest: false, depthWrite: false });
   const acc = new FullScreenQuad(accMat);
   const glow = new FullScreenQuad(new THREE.ShaderMaterial({ uniforms: { tex: { value: rtAcc.texture }, k: { value: 1 } }, vertexShader: QUAD_VS, fragmentShader: COPY, depthTest: false, depthWrite: false }));
-  const outU = { tAcc: { value: rtAcc.texture }, tGlow: { value: rtGlow.texture }, tLut: { value: lut }, uExp: { value: 1.25 }, uSeed: { value: 0 }, uFx: { value: PLAIN ? 0 : 1 } };
+  const outU = { tAcc: { value: rtAcc.texture }, tGlow: { value: rtGlow.texture }, tLut: { value: lut }, uExp: { value: 1.25 }, uSeed: { value: 0 }, uFx: { value: PLAIN ? 0 : 1 },
+    uLens: { value: new THREE.Vector4(LN.distort, LN.fringe / Math.hypot(W / 2, H / 2), LN.noise, LN.falloff) }, uTan: { value: new THREE.Vector2() } };
   const out = new FullScreenQuad(new THREE.ShaderMaterial({ uniforms: outU, vertexShader: QUAD_VS,
-    fragmentShader: `precision highp sampler3D; uniform sampler2D tAcc, tGlow; uniform sampler3D tLut; uniform float uExp, uSeed, uFx; varying vec2 vUv;
+    fragmentShader: `precision highp sampler3D; uniform sampler2D tAcc, tGlow; uniform sampler3D tLut; uniform float uExp, uSeed, uFx; uniform vec4 uLens; uniform vec2 uTan; varying vec2 vUv;
+float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+vec3 sharp(vec2 uv) {                                                          // read the frame between its pixels with a 4 x 4 Catmull-Rom
+  vec2 p = uv * vec2(${W}.0, ${H}.0) - 0.5, i = floor(p), f = p - i;           // curve: plain bilinear cost 28 % of the fine detail
+  vec2 w[4] = vec2[4](f * (-0.5 + f * (1.0 - 0.5 * f)), 1.0 + f * f * (-2.5 + 1.5 * f), f * (0.5 + f * (2.0 - 1.5 * f)), f * f * (-0.5 + 0.5 * f));
+  vec3 s = vec3(0.0);
+  for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) s += w[x].x * w[y].y * texelFetch(tAcc, clamp(ivec2(i) + ivec2(x - 1, y - 1), ivec2(0), ivec2(${W - 1}, ${H - 1})), 0).rgb;
+  return max(s, 0.0);
+}
 void main() {
-  vec3 c = texture2D(tAcc, vUv).rgb, g = vec3(0.0);
-  for (int k = 1; k <= 6; k++) g += textureLod(tGlow, vUv, float(k)).rgb;     // lens glow: a little of every blur width
-  vec2 q = vUv - 0.5;
+  vec2 q = vUv - 0.5, qa = q * vec2(${(W / H).toFixed(5)}, 1.0);
+  float r2 = dot(qa, qa) / ${(0.25 * ((W * W) / (H * H) + 1)).toFixed(5)};       // 0 in the middle, 1 in the corners
+  vec2 d = q * (1.0 + uLens.x * r2) / (1.0 + uLens.x);                         // barrel: the corners stay, the middle swells
+  float f = uLens.y * r2;                                                      // fringing: red is drawn a little larger, blue smaller
+  vec3 c = vec3(sharp(0.5 + d * (1.0 + f)).r, sharp(0.5 + d).g, sharp(0.5 + d * (1.0 - f)).b), g = vec3(0.0);
+  for (int k = 1; k <= 6; k++) g += textureLod(tGlow, 0.5 + d, float(k)).rgb; // lens glow: a little of every blur width
   if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);                           // a path tracer leaves the odd broken pixel
   if (uFx > 0.0) c = mix(c, g / 6.0, 0.08);                                    // (one NaN anywhere would spread through the whole glow)
-  c *= uExp * (1.0 - 0.5 * dot(q, q) * uFx);                  // + vignette
+  float t2 = dot(q * uTan, q * uTan);                                          // tan^2 of this pixel's angle off the lens axis
+  c *= uExp * mix(1.0, 1.0 / ((1.0 + t2) * (1.0 + t2)), uLens.w);              // natural fall-off: cos^4 of that angle
+  vec3 n = vec3(0.0);                                                          // sensor noise, per colour: 4 dice summed is close to a bell curve
+  for (int k = 0; k < 4; k++) n += vec3(hash(gl_FragCoord.xy + uSeed + float(k) * 17.13), hash(gl_FragCoord.yx + uSeed + float(k) * 29.71 + 5.3), hash(gl_FragCoord.xy * 1.37 + uSeed + float(k) * 41.9 + 11.7));
+  c = max(c + (n - 2.0) * 1.7320508 * uLens.z * sqrt(0.18 * c), 0.0);          // photons arrive at random: the spread grows with the root of the light
   vec3 u = clamp((log2(max(c, vec3(1e-10))) + 12.47393) / 16.499999, 0.0, 1.0);
-  float n = fract(sin(dot(gl_FragCoord.xy + uSeed, vec2(12.9898, 78.233))) * 43758.5453);
-  gl_FragColor = vec4(texture(tLut, u * (64.0 / 65.0) + 0.5 / 65.0).rgb + (n - 0.5) * 0.014 * uFx, 1.0);   // + a breath of grain
+  gl_FragColor = vec4(texture(tLut, u * (64.0 / 65.0) + 0.5 / 65.0).rgb, 1.0);
 }`, depthTest: false, depthWrite: false }));
 
   const cam = new THREE.PerspectiveCamera(50, W / H, 0.1, 3000);
@@ -952,10 +992,11 @@ void main() {
       const hs = (b: number) => halton(i + 1, b);
       const c = update(PLAIN ? fr : fr + ((i + hs(2)) / passes - 0.5) * 0.5);   // shutter 0.5, centred on the frame
       const fwd = c.tgt.clone().sub(c.loc).normalize(), right = fwd.clone().cross(Z).normalize(), up = right.clone().cross(fwd);
-      const lr = PLAIN ? 0 : (c.lens / 1000 / (2 * 2.0)) * Math.sqrt(hs(3)), la = TAU * hs(5);   // f/2 aperture radius
-      const eyeP = c.loc.clone().addScaledVector(right, lr * Math.cos(la)).addScaledVector(up, lr * Math.sin(la));
-      cam.position.copy(b2t(eyeP)); cam.up.set(0, 1, 0); cam.lookAt(b2t(c.loc.clone().addScaledVector(fwd, c.focus)));
+      const lr = PLAIN ? 0 : c.lens / 1000 / (2 * LN.fstop), [ax, ay] = aperture(hs(3), hs(5), LN.blades, LN.squeeze);   // aperture radius, m
+      const eyeP = c.loc.clone().addScaledVector(right, lr * ax).addScaledVector(up, lr * ay);
+      cam.position.copy(b2t(eyeP)); cam.up.set(0, 1, 0); cam.lookAt(b2t(c.loc.clone().addScaledVector(fwd, c.focus))); cam.rotateZ(c.roll);
       cam.fov = (2 * Math.atan(12 / c.lens) * 180) / Math.PI;      // vertical sensor fit, 24 mm
+      outU.uTan.value.set((24 * W) / H / c.lens, 24 / c.lens);
       cam.setViewOffset(W, H, hs(7) - 0.5, hs(11) - 0.5, W, H);   // sub-pixel AA (also updates the projection)
       cam.updateMatrixWorld();
       const ty = Math.tan(rad(cam.fov) / 2) * 1.02;
@@ -979,14 +1020,15 @@ void main() {
 
 /** passes: samples of our renderer. sky: a photo in public/js3d (see photoSky), "" = painted. scans: scanned bark,
  * wood, stone and leaf shapes from public/js3d instead of the generated ones. plain: our renderer without
- * its tricks. pt: path-trace the plain scene with this many samples instead (reference only; needs a photo sky). */
-export const Js3dGarden: React.FC<{ passes?: number; sky?: string; scans?: boolean; plain?: boolean; pt?: number }> = ({ passes = 32, sky = "", scans = false, plain = false, pt = 0 }) => {
+ * its tricks. pt: path-trace the plain scene with this many samples instead (reference only; needs a photo sky).
+ * lens: any of LENS's numbers, to try one without editing the file (--props='{"lens":{"blades":5}}'). */
+export const Js3dGarden: React.FC<{ passes?: number; sky?: string; scans?: boolean; plain?: boolean; pt?: number; lens?: Partial<typeof LENS> }> = ({ passes = 32, sky = "", scans = false, plain = false, pt = 0, lens = {} }) => {
   const frame = useCurrentFrame();
   const canvas = useRef<HTMLCanvasElement>(null);
   const ctx = useRef<Promise<(fr: number, passes: number, pt?: number) => Promise<void>> | null>(null);
   useLayoutEffect(() => {
     const h = delayRender(`garden frame ${frame}`);
-    ctx.current ??= build(canvas.current!, sky, plain || pt > 0, scans);
+    ctx.current ??= build(canvas.current!, sky, plain || pt > 0, scans, lens);
     ctx.current.then((render) => render(frame, passes, pt)).then(() => continueRender(h)).catch((e) => cancelRender(e));
   }, [frame, passes, pt]);
   return (
