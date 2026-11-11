@@ -4,6 +4,7 @@ import { FullScreenQuad } from "three/examples/jsm/postprocessing/Pass.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { HDRLoader } from "three/examples/jsm/loaders/HDRLoader.js";
+import { WebGLPathTracer } from "three-gpu-pathtracer";
 import { AbsoluteFill, cancelRender, continueRender, delayRender, staticFile, useCurrentFrame } from "remotion";
 
 // js3d-broll, outdoor worked example: a garden at golden hour, built from nothing (no Blender original, no assets).
@@ -85,7 +86,7 @@ void main() {
 /** Where the light comes from. sun: its direction, sunCol: its light on a surface facing it. pick(i): the sky direction
  * of pass i and the light that one sample stands for. fog: what distance fades to. ground: the lawn's bounce from
  * below. dome: what the camera sees behind everything. */
-type Sky = { sun: V3; sunCol: number[]; fog: number[]; ground: number[]; dome: THREE.Material; pick: (i: number) => { d: V3; c: number[] } };
+type Sky = { sun: V3; sunCol: number[]; fog: number[]; ground: number[]; dome: THREE.Material; pick: (i: number) => { d: V3; c: number[] }; photo?: { tex: THREE.Texture; k: number; rot: number } };
 const DOME_VS = "varying vec3 vD; void main() { vD = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }";
 const r2 = (i: number) => [((i + 0.5) * 0.7548776662) % 1, ((i + 0.5) * 0.5698402910) % 1];   // points spread evenly over a square
 function paintedSky(): Sky {                         // no file needed: the gradient above, every direction equally likely
@@ -140,7 +141,7 @@ async function photoSky(name: string, az: number, light = 2.6): Promise<Sky> {
     fragmentShader: `uniform sampler2D tSky; varying vec3 vD; void main() { vec3 d = normalize(vD);
   vec2 uv = vec2((atan(d.x, d.y) - ${fl(rot)}) / 6.2831853 + 0.5, 0.5 + asin(d.z) / 3.1415927);
   gl_FragColor = vec4(min(textureLod(tSky, uv, 0.0).rgb * ${fl(k)}, vec3(60.0)), 1.0); }` });   // capped: the sun's own disk is the sun light's job
-  return { sun, sunCol: sunE.map((x) => x * k), fog: low.map((x) => (x / lowW) * k), ground: [0.085, 0.105, 0.036].map((a, c) => a * (skyE[c] + sunE[c] * sun.z) * k), dome, pick };
+  return { sun, sunCol: sunE.map((x) => x * k), fog: low.map((x) => (x / lowW) * k), ground: [0.085, 0.105, 0.036].map((a, c) => a * (skyE[c] + sunE[c] * sun.z) * k), dome, pick, photo: { tex: t, k, rot } };
 }
 
 // ---------------------------------------------------------------- geometry
@@ -266,6 +267,11 @@ const quat = (y: V3, zh: V3) => {                    // rotation taking +Y to y 
 
 // ---------------------------------------------------------------- materials: wind, instancing, light through leaves, fur
 const timeU = { value: 0 };
+// PLAIN: the scene without any of our shader tricks - instances baked to real triangles, no wind, no light through
+// leaves, no fur shells, no haze, no lens. The path tracer (prop pt) needs it that way, because it runs none of our
+// shaders; our own renderer can render the same thing (prop plain), and the difference between the two is then light
+// transport alone.
+let PLAIN = false;
 const WIND = `uniform float uTime;
 vec3 qrot(vec4 q, vec3 v) { return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v); }
 vec2 gust(vec2 p, float r) {     // lawn: waves travelling with the wind + each blade's own shiver
@@ -285,6 +291,7 @@ const trans = (fs: string, t: number[]) => fs.replace("#include <lights_physical
  * from behind. root: brightness at the foot of a blade (the lawn's own shade). */
 type Opt = { inst?: boolean; wind?: number; nb?: number; trans?: number[]; root?: number };
 function patch<T extends THREE.Material>(m: T, o: Opt): T {
+  if (PLAIN) return m;
   m.customProgramCacheKey = () => JSON.stringify(o);   // three keys programs by onBeforeCompile's source text: say what differs
   m.onBeforeCompile = (s) => {
     s.uniforms.uTime = timeU;
@@ -318,7 +325,31 @@ class Scatter {                                      // many copies of one small
     this.a[0].push(p.x, p.y, p.z); this.a[1].push(q.x, q.y, q.z, q.w); this.a[2].push(s[0], s[1], s[2]);
     this.a[3].push(c[0], c[1], c[2]); this.a[4].push(n.x, n.y, n.z); this.a[5].push(r);
   }
+  baked(base: THREE.BufferGeometry, m: THREE.Material) {        // the same copies as real triangles
+    const P = base.attributes.position, N = base.attributes.normal, C = base.attributes.color, I = base.index!, n = this.a[5].length, nv = P.count, [ap, aq, as, ac] = this.a;
+    const pos = new Float32Array(n * nv * 3), nor = new Float32Array(n * nv * 3), colr = new Float32Array(n * nv * 3), idx = new Uint32Array(n * I.count), q = new THREE.Quaternion(), v = V();
+    for (let i = 0; i < n; i++) {
+      q.set(aq[i * 4], aq[i * 4 + 1], aq[i * 4 + 2], aq[i * 4 + 3]);
+      for (let j = 0; j < nv; j++) {
+        const o = (i * nv + j) * 3;
+        v.set(P.getX(j) * as[i * 3], P.getY(j) * as[i * 3 + 1], P.getZ(j) * as[i * 3 + 2]).applyQuaternion(q);
+        pos[o] = v.x + ap[i * 3]; pos[o + 1] = v.y + ap[i * 3 + 1]; pos[o + 2] = v.z + ap[i * 3 + 2];
+        v.set(N.getX(j) / as[i * 3], N.getY(j) / as[i * 3 + 1], N.getZ(j) / as[i * 3 + 2]).applyQuaternion(q).normalize();
+        nor[o] = v.x; nor[o + 1] = v.y; nor[o + 2] = v.z;
+        for (let c = 0; c < 3; c++) colr[o + c] = ac[i * 3 + c] * (C ? C.getComponent(j, c) : 1);
+      }
+      const flip = as[i * 3] * as[i * 3 + 1] * as[i * 3 + 2] < 0;   // a mirrored copy: turn its triangles round, or facing and normal disagree
+      for (let j = 0; j < I.count; j++) idx[i * I.count + j] = I.getX(flip ? j - (j % 3) + ((3 - (j % 3)) % 3) : j) + i * nv;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3)); g.setAttribute("normal", new THREE.BufferAttribute(nor, 3));
+    g.setAttribute("color", new THREE.BufferAttribute(colr, 3)); g.setIndex(new THREE.BufferAttribute(idx, 1));
+    (m as THREE.MeshStandardMaterial).vertexColors = true;
+    const me = new THREE.Mesh(g, m); me.frustumCulled = false; me.castShadow = me.receiveShadow = true;
+    return me;
+  }
   mesh(base: THREE.BufferGeometry, m: THREE.Material, o: Opt) {
+    if (PLAIN) return this.baked(base, m);
     const g = new THREE.InstancedBufferGeometry();
     g.index = base.index; for (const k in base.attributes) g.setAttribute(k, base.attributes[k]);
     ["iPos", "iQuat", "iScale", "iCol", "iNrm", "iRnd"].forEach((k, i) => g.setAttribute(k, new THREE.InstancedBufferAttribute(new Float32Array(this.a[i]), [3, 4, 3, 3, 3, 1][i])));
@@ -355,7 +386,7 @@ diffuseColor.rgb *= (0.5 + 0.5 * vH) * (0.75 + 0.5 * fr);`), [1.0, 0.8, 0.55]);
   const skin = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ roughness: 0.9, vertexColors: true, color: col([0.45, 0.45, 0.45]) }));
   const shells = new THREE.Mesh(ig, m);
   skin.castShadow = skin.receiveShadow = shells.receiveShadow = true; shells.frustumCulled = false;
-  const o = new THREE.Group(); o.add(skin, shells); return o;
+  const o = new THREE.Group(); o.add(skin); if (!PLAIN) o.add(shells); return o;
 }
 
 // ---------------------------------------------------------------- tree
@@ -481,7 +512,8 @@ function makeButterfly() {
 }
 
 // ---------------------------------------------------------------- the whole scene
-async function build(canvas: HTMLCanvasElement, skyName: string) {
+async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean) {
+  PLAIN = plain;
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(1); renderer.setSize(W, H, false);
   renderer.autoClear = false;
@@ -497,7 +529,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string) {
 
   const sky = skyName ? await photoSky(skyName, SUN_AZ) : paintedSky();
   const scene = new THREE.Scene();
-  scene.fog = new THREE.FogExp2(col(sky.fog), 0.018);               // haze: far things fade to the low sky's colour
+  if (!PLAIN) scene.fog = new THREE.FogExp2(col(sky.fog), 0.018);   // haze: far things fade to the low sky's colour
   const root = new THREE.Group(); root.rotation.x = -Math.PI / 2; scene.add(root);   // Blender Z up -> three Y up
   const put = (g: THREE.BufferGeometry, m: THREE.Material, parent: THREE.Object3D = root) => { const o = new THREE.Mesh(g, m); o.castShadow = o.receiveShadow = true; parent.add(o); return o; };
 
@@ -513,10 +545,10 @@ async function build(canvas: HTMLCanvasElement, skyName: string) {
 
   // lights: the sun, one sky sample per pass (colour set in the pass loop), the lawn's own bounce from below
   const sun = new THREE.DirectionalLight(col(sky.sunCol), 1), skyL = new THREE.DirectionalLight(0xffffff, 1);
-  for (const [l, n] of [[sun, 8192], [skyL, 4096]] as const) {
-    l.castShadow = true; l.shadow.mapSize.set(n, n); l.shadow.bias = -0.0004; l.shadow.normalBias = 0.012; scene.add(l, l.target);
+  for (const [l, n] of [[sun, 8192], [skyL, 4096]] as const) {   // normalBias: keep it under the thinnest thing in the scene (1.2 cm made every 5 mm blade read its neighbour's shadow)
+    l.castShadow = true; l.shadow.mapSize.set(n, n); l.shadow.bias = -0.0004; l.shadow.normalBias = 0.0015; scene.add(l, l.target);
   }
-  scene.add(new THREE.HemisphereLight(0x000000, col(sky.ground), 1.0));
+  const hemi = new THREE.HemisphereLight(0x000000, col(sky.ground), 1.0); scene.add(hemi);
   const CEN = b2t(V(0, 3, 3)), CORNERS = Array.from({ length: 8 }, (_, i) => b2t(V(i & 1 ? 6.5 : -6.5, i & 2 ? 12.5 : -6, i & 4 ? 6.5 : -0.3)));
   function aim(l: THREE.DirectionalLight, d: V3) {                 // point a light and fit its shadow map around the garden
     l.position.copy(CEN).addScaledVector(b2t(d), 40); l.target.position.copy(CEN);
@@ -670,7 +702,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string) {
   robin.g.scale.setScalar(0.58); robin.g.position.copy(G(BATH.x, BATH.y, 0.695)).add(V(-0.285, -0.1, 0)); root.add(robin.g);
   const flies = [0, 1, 2].map(() => { const b = makeButterfly(); root.add(b.g); return b; });
   const midges = new THREE.InstancedMesh(new THREE.SphereGeometry(0.0016, 6, 4), patch(new THREE.MeshStandardMaterial({ color: col([0.9, 0.85, 0.7]), roughness: 0.8 }), { trans: [1.6, 1.6, 1.6] }), 60);
-  midges.frustumCulled = false; root.add(midges);
+  midges.frustumCulled = false; midges.visible = !PLAIN; root.add(midges);
   const MR = rng(60), MID = Array.from({ length: 60 }, () => Array.from({ length: 9 }, () => MR()));
   const leafM = patch(new THREE.MeshStandardMaterial({ color: col(lin([0.70, 0.56, 0.14])), roughness: 0.6, side: THREE.DoubleSide }), { trans: LEAF_T });
   const drops = [[30, -0.25, 0.85, 3.1, 0.4], [112, 0.35, 1.2, 2.8, 2.1]].map((d) => { const o = put(leafG, leafM); o.scale.setScalar(0.085); return [o, ...d] as [THREE.Mesh, ...number[]]; });
@@ -732,17 +764,19 @@ async function build(canvas: HTMLCanvasElement, skyName: string) {
     blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor, depthTest: false, depthWrite: false });
   const acc = new FullScreenQuad(accMat);
   const glow = new FullScreenQuad(new THREE.ShaderMaterial({ uniforms: { tex: { value: rtAcc.texture }, k: { value: 1 } }, vertexShader: QUAD_VS, fragmentShader: COPY, depthTest: false, depthWrite: false }));
-  const outU = { tAcc: { value: rtAcc.texture }, tGlow: { value: rtGlow.texture }, tLut: { value: lut }, uExp: { value: 1.25 }, uSeed: { value: 0 } };
+  const outU = { tAcc: { value: rtAcc.texture }, tGlow: { value: rtGlow.texture }, tLut: { value: lut }, uExp: { value: 1.25 }, uSeed: { value: 0 }, uFx: { value: PLAIN ? 0 : 1 } };
   const out = new FullScreenQuad(new THREE.ShaderMaterial({ uniforms: outU, vertexShader: QUAD_VS,
-    fragmentShader: `precision highp sampler3D; uniform sampler2D tAcc, tGlow; uniform sampler3D tLut; uniform float uExp, uSeed; varying vec2 vUv;
+    fragmentShader: `precision highp sampler3D; uniform sampler2D tAcc, tGlow; uniform sampler3D tLut; uniform float uExp, uSeed, uFx; varying vec2 vUv;
 void main() {
   vec3 c = texture2D(tAcc, vUv).rgb, g = vec3(0.0);
   for (int k = 1; k <= 6; k++) g += textureLod(tGlow, vUv, float(k)).rgb;     // lens glow: a little of every blur width
   vec2 q = vUv - 0.5;
-  c = mix(c, g / 6.0, 0.08) * uExp * (1.0 - 0.5 * dot(q, q));                  // + vignette
+  if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);                           // a path tracer leaves the odd broken pixel
+  if (uFx > 0.0) c = mix(c, g / 6.0, 0.08);                                    // (one NaN anywhere would spread through the whole glow)
+  c *= uExp * (1.0 - 0.5 * dot(q, q) * uFx);                  // + vignette
   vec3 u = clamp((log2(max(c, vec3(1e-10))) + 12.47393) / 16.499999, 0.0, 1.0);
   float n = fract(sin(dot(gl_FragCoord.xy + uSeed, vec2(12.9898, 78.233))) * 43758.5453);
-  gl_FragColor = vec4(texture(tLut, u * (64.0 / 65.0) + 0.5 / 65.0).rgb + (n - 0.5) * 0.014, 1.0);   // + a breath of grain
+  gl_FragColor = vec4(texture(tLut, u * (64.0 / 65.0) + 0.5 / 65.0).rgb + (n - 0.5) * 0.014 * uFx, 1.0);   // + a breath of grain
 }`, depthTest: false, depthWrite: false }));
 
   const cam = new THREE.PerspectiveCamera(50, W / H, 0.1, 3000);
@@ -759,15 +793,60 @@ void main() {
       .replace("#include <begin_vertex>", "float hd = uHz.x + uHz.y * position.z; vec3 transformed = vec3(position.x * uHz.z * hd, position.y * uHz.w * hd, -hd);")
       .replace("#include <defaultnormal_vertex>", "vec3 transformedNormal = uSunV;");
   };
-  const haze = new THREE.Mesh(hazeG, hazeM); haze.frustumCulled = false; haze.receiveShadow = true; haze.renderOrder = 10; cam.add(haze);
+  const haze = new THREE.Mesh(hazeG, hazeM); haze.frustumCulled = false; haze.receiveShadow = true; haze.renderOrder = 10; haze.visible = !PLAIN; cam.add(haze);
   const su = sky.sun.clone().cross(Z).normalize(), sv = sky.sun.clone().cross(su);
-  return function render(fr: number, passes: number) {
+  // reference renderer: real path tracing of the same (plain) scene, lit by the sky photo alone - every bounce included
+  let tracer: WebGLPathTracer | null = null;
+  async function trace(fr: number, samples: number) {
+    if (!sky.photo) throw new Error("the path tracer needs a photo sky (prop sky)");
+    const c = update(fr), fwd = c.tgt.clone().sub(c.loc).normalize();
+    cam.position.copy(b2t(c.loc)); cam.up.set(0, 1, 0); cam.lookAt(b2t(c.loc.clone().addScaledVector(fwd, c.focus)));
+    cam.fov = (2 * Math.atan(12 / c.lens) * 180) / Math.PI; cam.clearViewOffset(); cam.updateProjectionMatrix();
+    for (const o of [sun, skyL, hemi, skyG, haze, midges]) o.removeFromParent();   // its light is the photo: no lights of ours, no dome in the way
+    // it keeps the sky as half floats (max 65 504) and this sun is far brighter: hand it a dimmed copy, turn the light back up
+    const src = sky.photo.tex, im = src.image as unknown as { width: number; height: number; data: Float32Array };
+    let top = 0; for (let i = 0; i < im.data.length; i++) if (im.data[i] > top) top = im.data[i];
+    const dim = Math.max(1, Math.ceil(top / 60000)), envT = new THREE.DataTexture(im.data.map((v) => v / dim), im.width, im.height, src.format, src.type);
+    envT.flipY = src.flipY; envT.colorSpace = src.colorSpace; envT.wrapS = THREE.RepeatWrapping; envT.minFilter = envT.magFilter = THREE.LinearFilter; envT.needsUpdate = true;
+    scene.environment = scene.background = envT;
+    scene.environmentIntensity = scene.backgroundIntensity = sky.photo.k * dim;
+    scene.environmentRotation.set(0, Math.PI / 2 - sky.photo.rot, 0); scene.backgroundRotation.copy(scene.environmentRotation);
+    scene.traverse((o) => {                                          // 0.0.27 drops 3-component vertex colours when it merges meshes (they come out black)
+      const g = (o as THREE.Mesh).geometry, c = g?.attributes.color;
+      if (!c || c.itemSize !== 3) return;
+      const a = new Float32Array(c.count * 4);
+      for (let i = 0; i < c.count; i++) { a[i * 4] = c.getX(i); a[i * 4 + 1] = c.getY(i); a[i * 4 + 2] = c.getZ(i); a[i * 4 + 3] = 1; }
+      g.setAttribute("color", new THREE.BufferAttribute(a, 4));
+    });
+    scene.updateMatrixWorld();
+    tracer ??= new WebGLPathTracer(renderer);
+    tracer.renderToCanvas = false; tracer.renderDelay = 0; tracer.bounces = 8; tracer.tiles.set(2, 2); tracer.textureSize.set(512, 512);
+    tracer.setScene(scene, cam);
+    const t0 = performance.now();
+    while (tracer.samples < samples) {                               // it compiles and renders asynchronously: give it the event loop between tiles
+      tracer.renderSample();
+      await new Promise((r) => setTimeout(r, 0));
+      if (performance.now() - t0 > 900000) throw new Error(`path tracer: only ${tracer.samples} samples after 15 min`);
+    }
+    outU.tAcc.value = tracer.target.texture;
+    renderer.setRenderTarget(null); out.render(renderer);
+    // After the tracer has run, headless Chrome shows this WebGL canvas as solid magenta (also through drawImage; cause not
+    // found), although the pixels in it are right. So read them back and show them on a plain 2D canvas on top.
+    const gl = renderer.getContext(), px = new Uint8Array(W * H * 4), img = new ImageData(W, H);
+    gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    for (let y = 0; y < H; y++) img.data.set(px.subarray((H - 1 - y) * W * 4, (H - y) * W * 4), y * W * 4);
+    const flat = document.createElement("canvas"); flat.width = W; flat.height = H; flat.style.cssText = "position:absolute;left:0;top:0;width:100%;height:100%";
+    flat.getContext("2d")!.putImageData(img, 0, 0); canvas.parentElement!.appendChild(flat);
+    tracer.dispose(); tracer = null;
+  }
+  return async function render(fr: number, passes: number, pt = 0) {
+    if (pt) return trace(fr, pt);
     renderer.setRenderTarget(rtAcc); renderer.setClearColor(0x000000, 0); renderer.clear();
     for (let i = 0; i < passes; i++) {
       const hs = (b: number) => halton(i + 1, b);
-      const c = update(fr + ((i + hs(2)) / passes - 0.5) * 0.5);   // shutter 0.5, centred on the frame
+      const c = update(PLAIN ? fr : fr + ((i + hs(2)) / passes - 0.5) * 0.5);   // shutter 0.5, centred on the frame
       const fwd = c.tgt.clone().sub(c.loc).normalize(), right = fwd.clone().cross(Z).normalize(), up = right.clone().cross(fwd);
-      const lr = (c.lens / 1000 / (2 * 2.0)) * Math.sqrt(hs(3)), la = TAU * hs(5);   // f/2 aperture radius
+      const lr = PLAIN ? 0 : (c.lens / 1000 / (2 * 2.0)) * Math.sqrt(hs(3)), la = TAU * hs(5);   // f/2 aperture radius
       const eyeP = c.loc.clone().addScaledVector(right, lr * Math.cos(la)).addScaledVector(up, lr * Math.sin(la));
       cam.position.copy(b2t(eyeP)); cam.up.set(0, 1, 0); cam.lookAt(b2t(c.loc.clone().addScaledVector(fwd, c.focus)));
       cam.fov = (2 * Math.atan(12 / c.lens) * 180) / Math.PI;      // vertical sensor fit, 24 mm
@@ -792,15 +871,17 @@ void main() {
   };
 }
 
-export const Js3dGarden: React.FC<{ passes?: number; sky?: string }> = ({ passes = 32, sky = "" }) => {
+/** passes: samples of our renderer. sky: a photo in public/js3d (see photoSky), "" = painted. plain: our renderer without
+ * its tricks. pt: path-trace the plain scene with this many samples instead (reference only; needs a photo sky). */
+export const Js3dGarden: React.FC<{ passes?: number; sky?: string; plain?: boolean; pt?: number }> = ({ passes = 32, sky = "", plain = false, pt = 0 }) => {
   const frame = useCurrentFrame();
   const canvas = useRef<HTMLCanvasElement>(null);
-  const ctx = useRef<Promise<(fr: number, passes: number) => void> | null>(null);
+  const ctx = useRef<Promise<(fr: number, passes: number, pt?: number) => Promise<void>> | null>(null);
   useLayoutEffect(() => {
     const h = delayRender(`garden frame ${frame}`);
-    ctx.current ??= build(canvas.current!, sky);
-    ctx.current.then((render) => { render(frame, passes); continueRender(h); }).catch((e) => cancelRender(e));
-  }, [frame, passes]);
+    ctx.current ??= build(canvas.current!, sky, plain || pt > 0);
+    ctx.current.then((render) => render(frame, passes, pt)).then(() => continueRender(h)).catch((e) => cancelRender(e));
+  }, [frame, passes, pt]);
   return (
     <AbsoluteFill style={{ backgroundColor: "black" }}>
       <canvas ref={canvas} width={W} height={H} style={{ width: "100%", height: "100%" }} />

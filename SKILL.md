@@ -32,6 +32,12 @@ The Remotion project `~/claude-code/animations` already has three.js and renders
 mkdir -p ~/claude-code/animations/public/js3d && cp ~/.claude/skills/js3d-broll/assets/agx_mhc_65.bin ~/claude-code/animations/public/js3d/
 ```
 
+`GardenScene.tsx` imports the path tracer (its reference mode, see below), so that template needs two packages:
+
+```bash
+cd ~/claude-code/animations && npm i three-gpu-pathtracer@0.0.27 three-mesh-bvh
+```
+
 For outdoor scenes, a sky photo (23.8 MB, CC0; ask Ben before downloading, others are listed at polyhaven.com/hdris):
 
 ```bash
@@ -129,6 +135,40 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
 - **Look**: the painted dome is drawn 0.62x darker than it lights (a white sky otherwise), a photo as it is; glow = 8 % of the frame's own mip
   chain; vignette; 1.4 % grain seeded by the frame number; FogExp2 for the far distance.
 
+## A reference inside JS: path-trace the same scene
+
+`three-gpu-pathtracer` traces the scene in the same headless Chrome: every bounce, no shadow maps. It is the judge,
+not the renderer: on the garden (3.69 M triangles) a sample takes 1.35 s, so 64 samples = 100 s, 256 = 6 min, and the
+240-frame clip at 256 samples would take 24 h. Use it for single reference frames.
+
+```bash
+cd ~/claude-code/animations   # the tracer is 0.0.27 on purpose: 0.0.28 needs three >= 0.187
+npx remotion still src/index.ts <Id> ref.png --frame=150 --props='{"sky":"spruit_sunrise","pt":256}' --timeout=1200000
+npx remotion still src/index.ts <Id> ours.png --frame=150 --props='{"sky":"spruit_sunrise","plain":true}'
+python3 ~/.claude/skills/js3d-broll/scripts/compare.py ref.png ours.png   # PSNR at quarter size + mean colour of named boxes (edit them)
+```
+
+- `pt` and `plain` both render the PLAIN scene: instances baked to real triangles (`Scatter.baked`), no wind, no
+  light through leaves, no fur shells, no haze, no lens. The tracer runs none of our shaders, so the comparison
+  measures light transport only. It cannot judge the full look.
+- Garden, frame 150, 2026-11-11: ours against the 256-sample reference 27.9 dB, whole frame within 2/255 (control:
+  the same frame shifted 8 px = 16.9 dB; noise floor, 64 against 256 samples = 42.4 dB). What it found:
+  - Shadow `normalBias` was 1.2 cm, wider than a 5 mm blade, so every blade read its neighbour's shadow and the
+    lawn was 12/255 too dark. 1.5 mm fixed it (25.0 -> 27.9 dB). Keep it under the thinnest thing in the scene.
+  - More shadow-map resolution changed nothing (16384 + 8192: 24.8 dB). Do not spend time there.
+  - The HemisphereLight standing in for ground bounce is needed and about right: without it 24.1 dB, frame 6/255 dark.
+  - The trunk stays 10/255 too bright; 6 of that is the bark bump map, which the tracer ignores.
+- What the tracer needed (each one cost a black or wrong frame):
+  - It stores the sky as half floats, so a sun above 65 504 is clipped and the light turns cold. Hand it a dimmed
+    copy of the photo and raise `environmentIntensity` by the same factor.
+  - 0.0.27 drops 3-component vertex colours when it merges meshes (black): convert them to 4 components.
+  - A mirrored copy (negative scale) needs its triangles reversed when baked, or facing and normal disagree (black).
+    Our own renderer hides that mistake.
+  - It compiles and renders asynchronously: loop `renderSample()` with an `await` in between until `samples` is
+    reached, `renderDelay = 0`, `renderToCanvas = false`, then put its `target` through our LUT stage.
+  - Its sheen is far stronger than three's (the blackbird came out grey) and it has no bump maps.
+  - `WebGLPathTracer` is marked deprecated in favour of a WebGPU one; pin the version.
+
 ## Measured facts (do not re-derive)
 
 - Colour: Blender 5.2's AgX is not three.js's `AgXToneMapping` (grey 0.18 -> 118 vs 128, up to 48/255 off). The
@@ -152,6 +192,11 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
 - A JS number pasted into GLSL must be a float literal (`x.toFixed(5)`): `vBase * 700` does not compile.
 - Internal shader names change between three versions (r185: `material.diffuseContribution`, not `diffuseColor`).
   Grep the chunk in `node_modules/three/src/renderers/shaders/ShaderChunk/` before patching it.
+- Never run two renders at once. Headless Chrome then shows the WebGL canvas as solid magenta (255, 0, 255) although
+  the pixels in it are right; the same happens after the path tracer has run. `trace()` reads the pixels back with
+  `gl.readPixels` and shows them on a 2D canvas; a normal render just has to run alone.
+- The template packs several statements on a line. A `//` comment added in the middle of one silently removes the
+  rest: that is how `scene.add(light)` vanished once and the frame went almost black. Comments at line ends only.
 - Depth of field needs passes: each pass is one sharp copy of the scene, so few passes show a blur as ghost copies.
   f/1.4 at 8 passes (crown ~12 px out of focus) smeared the whole tree; f/2 at 16-32 passes was clean. Judge blur
   at 32 passes, not on the 8-pass test frames.
