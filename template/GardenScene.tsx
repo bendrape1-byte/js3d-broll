@@ -237,7 +237,7 @@ function limb(pts: V3[], rs: number[], ns: number, flare: number | null = null) 
       const a = (k / ns) * TAU, n = u.clone().multiplyScalar(Math.cos(a)).addScaledVector(v, Math.sin(a));
       let r = rs[i];
       if (flare !== null) r *= 1 + 0.9 * Math.exp(-(q.z - flare) / 0.16) * (1 + 0.4 * Math.sin(5 * a + 1.3)) + 0.08 * PN.noise(Math.cos(a) * 1.6, Math.sin(a) * 1.6, q.z * 2.5);
-      P.push(q.x + n.x * r, q.y + n.y * r, q.z + n.z * r); N.push(n.x, n.y, n.z); U.push((k / ns) * (flare !== null ? 2 : 1), len / 0.5);
+      P.push(q.x + n.x * r, q.y + n.y * r, q.z + n.z * r); N.push(n.x, n.y, n.z); U.push(k / ns, len / 0.5);
     }
   });
   for (let i = 0; i < pts.length - 1; i++) for (let k = 0; k < ns; k++) { const a = i * (ns + 1) + k; I.push(a, a + 1, a + ns + 1, a + 1, a + ns + 2, a + ns + 1); }
@@ -289,14 +289,21 @@ const trans = (fs: string, t: number[]) => fs.replace("#include <lights_physical
 /** inst: per-instance iPos/iQuat/iScale/iCol (Scatter). wind: 1 lawn, 2 tree. nb: blend the normal towards the
  * instance's "volume normal" iNrm (a lawn or a crown shades as one soft body). trans: tint of the light coming through
  * from behind. root: brightness at the foot of a blade (the lawn's own shade). */
-type Opt = { inst?: boolean; wind?: number; nb?: number; trans?: number[]; root?: number };
+type Opt = { inst?: boolean; wind?: number; nb?: number; trans?: number[]; root?: number; atlas?: boolean };
+// A scanned sheet of six leaves (ambientCG LeafSet004, CC0): the rectangle of each leaf in it, and the sheet's mean
+// brightness. A leaf is a card showing one of the six, cut out by the sheet's mask (in the shadow pass too); the
+// sheet gives shape, veins and blotches, the colour stays the instance's own.
+const LEAVES = [[0.1094, 0.5146, 0.3408, 0.9580], [0.3740, 0.5059, 0.6211, 0.9561], [0.6455, 0.5322, 0.9072, 0.9385], [0.1250, 0.0420, 0.3545, 0.4697], [0.4141, 0.0439, 0.6270, 0.4590], [0.6738, 0.0469, 0.9023, 0.4512]];
+const LEAF_LUM = 0.1009, leafU = { tLeaf: { value: null as THREE.Texture | null }, tLeafA: { value: null as THREE.Texture | null } };
 function patch<T extends THREE.Material>(m: T, o: Opt): T {
   if (PLAIN) return m;
   m.customProgramCacheKey = () => JSON.stringify(o);   // three keys programs by onBeforeCompile's source text: say what differs
   m.onBeforeCompile = (s) => {
     s.uniforms.uTime = timeU;
     let vs = s.vertexShader.replace("#include <common>", `#include <common>\n#define WIND ${o.wind ?? 0}\n${o.nb !== undefined ? `#define NB ${fl(o.nb)}\n` : ""}${WIND}`
-      + (o.inst ? "attribute vec3 iPos, iScale, iCol, iNrm; attribute vec4 iQuat; attribute float iRnd; varying vec3 vICol; varying float vT;\n" : ""));
+      + (o.inst ? "attribute vec3 iPos, iScale, iCol, iNrm; attribute vec4 iQuat; attribute float iRnd; varying vec3 vICol; varying float vT;\n" : "")
+      + (o.atlas ? `varying vec2 vLeafUv; const vec4 LEAF[6] = vec4[6](${LEAVES.map((r) => `vec4(${r.map(fl).join(", ")})`).join(", ")});\n` : ""));
+    if (o.atlas) { Object.assign(s.uniforms, leafU); vs = vs.replace("#include <begin_vertex>", "#include <begin_vertex>\nvec4 lf = LEAF[min(int(fract(iRnd * 7.31) * 6.0), 5)]; vLeafUv = mix(lf.xy, lf.zw, uv);"); }
     if (o.inst) vs = vs.replace("#include <begin_vertex>", `vec3 transformed = iPos + qrot(iQuat, position * iScale);
 #if WIND == 1
 transformed.xy += gust(iPos.xy, iRnd) * (position.y * position.y * iScale.y);
@@ -313,6 +320,9 @@ objectNormal = normalize(mix(objectNormal, iNrm, NB));
     let fs = s.fragmentShader;
     if (o.inst) fs = fs.replace("#include <common>", "#include <common>\nvarying vec3 vICol; varying float vT;")
       .replace("#include <color_fragment>", `#include <color_fragment>\ndiffuseColor.rgb *= vICol * mix(${fl(o.root ?? 1)}, 1.0, smoothstep(0.0, 0.7, vT));`);
+    if (o.atlas) fs = fs.replace("#include <common>", "#include <common>\nuniform sampler2D tLeaf, tLeafA; varying vec2 vLeafUv;")
+      .replace("void main() {", "void main() {\n\tif (texture2D(tLeafA, vLeafUv).r < 0.5) discard;")
+      .replace("#include <color_fragment>", `#include <color_fragment>\ndiffuseColor.rgb *= clamp(dot(texture2D(tLeaf, vLeafUv).rgb, vec3(0.2126, 0.7152, 0.0722)) / ${fl(LEAF_LUM)}, 0.3, 2.2);`);
     if (o.nb !== undefined) fs = fs.replace("#include <normal_fragment_begin>", THREE.ShaderChunk.normal_fragment_begin.replace("normal *= faceDirection;", ""));
     if (o.trans) fs = trans(fs, o.trans);
     s.fragmentShader = fs;
@@ -355,7 +365,7 @@ class Scatter {                                      // many copies of one small
     ["iPos", "iQuat", "iScale", "iCol", "iNrm", "iRnd"].forEach((k, i) => g.setAttribute(k, new THREE.InstancedBufferAttribute(new Float32Array(this.a[i]), [3, 4, 3, 3, 3, 1][i])));
     g.instanceCount = this.a[5].length;
     const me = new THREE.Mesh(g, patch(m, { ...o, inst: true }));
-    me.customDepthMaterial = patch(new THREE.MeshDepthMaterial({ side: THREE.DoubleSide }), { inst: true, wind: o.wind });   // shadows move with the wind too
+    me.customDepthMaterial = patch(new THREE.MeshDepthMaterial({ side: THREE.DoubleSide }), { inst: true, wind: o.wind, atlas: o.atlas });   // shadows move with the wind too
     me.frustumCulled = false; me.castShadow = me.receiveShadow = true;
     return me;
   }
@@ -512,7 +522,7 @@ function makeButterfly() {
 }
 
 // ---------------------------------------------------------------- the whole scene
-async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean) {
+async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean, scans: boolean) {
   PLAIN = plain;
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(1); renderer.setSize(W, H, false);
@@ -557,6 +567,21 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean)
     c.left = b.min.x; c.right = b.max.x; c.bottom = b.min.y; c.top = b.max.y; c.near = -b.max.z - 1; c.far = -b.min.z + 1; c.updateProjectionMatrix();
   }
 
+  // scanned surfaces (polyhaven.com, CC0: colour, normal and roughness maps), else the generated ones below
+  const TL = new THREE.TextureLoader();
+  const scan = async (name: string, rx = 1, ry = 1, nrm = 1) => {
+    const [map, normalMap, roughnessMap] = await Promise.all(["diff", "nor_gl", "rough"].map((k) => TL.loadAsync(staticFile(`js3d/${name}_${k}_2k.jpg`))));
+    for (const t of [map, normalMap, roughnessMap]) { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(rx, ry); t.anisotropy = 8; }
+    map.colorSpace = THREE.SRGBColorSpace;
+    return { map, normalMap, roughnessMap, roughness: 1, normalScale: new THREE.Vector2(nrm, nrm) };
+  };
+  const S = scans ? { bark: await scan("bark_brown_02", 1, 0.6, 2.5), wood: await scan("rough_wood"), stone: await scan("concrete_floor_02"), bath: await scan("concrete_floor_02", 3, 1.5) } : null;
+  if (scans && !PLAIN) {
+    leafU.tLeaf.value = await TL.loadAsync(staticFile("js3d/LeafSet004_1K-JPG_Color.jpg")); leafU.tLeaf.value.colorSpace = THREE.SRGBColorSpace;
+    leafU.tLeafA.value = await TL.loadAsync(staticFile("js3d/LeafSet004_1K-JPG_Opacity.jpg"));
+    for (const t of [leafU.tLeaf.value, leafU.tLeafA.value]) t.anisotropy = 8;
+  }
+  const cut = scans && !PLAIN;                                       // leaves as cut-out cards
   // textures
   const bark = tex(512, (cx, sx, v) => {
     let h = 0; for (const o of [1, 2, 4]) h += (1 - Math.abs(PN.noise(cx * 2.6 * o, sx * 2.6 * o, v * 0.55 * o))) / o;
@@ -577,7 +602,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean)
 
   // stepping stones, bird bath, fence
   const R = rng(7);
-  const stoneM = new THREE.MeshStandardMaterial({ ...stone, bumpScale: 1.5, roughness: 0.85 });
+  const stoneM = new THREE.MeshStandardMaterial(S ? S.stone : { ...stone, bumpScale: 1.5, roughness: 0.85 });
   for (const [x, y, r] of STONES) {
     const ph = R() * 9, rr = (a: number, k: number) => r * k * (1 + 0.16 * Math.sin(2 * a + ph) + 0.09 * Math.sin(3 * a + 2 * ph) + 0.05 * Math.sin(5 * a + ph));
     const rg = (z: number, k: number) => Array.from({ length: 20 }, (_, i) => { const a = (i / 20) * TAU; return V(x + rr(a, k) * Math.cos(a), y + rr(a, k) * Math.sin(a), gz(x, y) + z); });
@@ -587,7 +612,7 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean)
   }
   const bathG = new THREE.LatheGeometry([[0.001, 0], [0.2, 0], [0.19, 0.035], [0.08, 0.09], [0.058, 0.2], [0.055, 0.5], [0.085, 0.58], [0.29, 0.655], [0.32, 0.69], [0.318, 0.705], [0.3, 0.705], [0.27, 0.675], [0.001, 0.645]]
     .map((p) => new THREE.Vector2(p[0], p[1])), 48).rotateX(Math.PI / 2);
-  const bath = put(bathG, stoneM); bath.position.copy(G(BATH.x, BATH.y, -0.01));
+  const bath = put(bathG, S ? new THREE.MeshStandardMaterial(S.bath) : stoneM); bath.position.copy(G(BATH.x, BATH.y, -0.01));
   const water = put(new THREE.CircleGeometry(0.275, 48), new THREE.MeshPhysicalMaterial({ color: col([0.01, 0.014, 0.012]), roughness: 0.03, envMap: env }));
   water.position.copy(G(BATH.x, BATH.y, 0.672)); water.castShadow = false;
   const boards: THREE.BufferGeometry[] = [];
@@ -597,12 +622,12 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean)
     for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * 0.12 + o, uv.getY(i) * 0.9 + o * 7);
     boards.push(paint(g, () => [k, k * (0.96 + 0.06 * R()), k * 0.93]));
   }
-  put(mergeGeometries(boards), new THREE.MeshStandardMaterial({ ...wood, bumpScale: 1.2, roughness: 0.9, vertexColors: true }));
+  put(mergeGeometries(boards), new THREE.MeshStandardMaterial(S ? { ...S.wood, vertexColors: true } : { ...wood, bumpScale: 1.2, roughness: 0.9, vertexColors: true }));
 
   // tree, background trees, bushes: wood + one Scatter of leaves
   const leaves = new Scatter(), apples = new Scatter(), fallen = new Scatter(), petals = new Scatter();
   const leafA = lin([0.20, 0.36, 0.10]), leafB = lin([0.42, 0.52, 0.16]);
-  const barkM = patch(new THREE.MeshStandardMaterial({ ...bark, bumpScale: 3, roughness: 0.92 }), { wind: 2 });
+  const barkM = patch(new THREE.MeshStandardMaterial(S ? S.bark : { ...bark, bumpScale: 3, roughness: 0.92 }), { wind: 2 });
   const main = growTree(rng(11), G(TREE.x, TREE.y), 1, 4);
   put(main.wood, barkM);
   leafOut(leaves, rng(12), main.twigs, V(TREE.x, TREE.y, 3.0), 14, 0.085, leafA, leafB);
@@ -641,8 +666,11 @@ async function build(canvas: HTMLCanvasElement, skyName: string, plain: boolean)
     if (i < 9) { const sa = 0.032; apples.add(G(x * 0.8, y * 0.8 - 0.5, sa * 0.8), quat(V(R() - 0.5, R() - 0.5, R()), X), [sa, sa * 0.9, sa], mix(lin([0.62, 0.08, 0.05]), lin([0.62, 0.62, 0.16]), R()), Z, R()); }
   }
   const leafG = ribbon([[0, 0], [0.08, 0.05], [0.32, 0.23], [0.58, 0.27], [0.83, 0.17], [1, 0]], 0.25, -0.18);
-  root.add(leaves.mesh(leafG, plant(0.5), { wind: 2, nb: 0.5, trans: LEAF_T }));
-  root.add(fallen.mesh(leafG, plant(0.7), { nb: 0.6 }));
+  const cardG = new THREE.PlaneGeometry(0.7, 1.28, 2, 4).translate(0, 0.64, 0), cp = cardG.attributes.position;   // the leaf's rectangle, stalk at the origin
+  for (let i = 0; i < cp.count; i++) cp.setZ(i, -0.12 * cp.getY(i) ** 2 + 0.2 * Math.abs(cp.getX(i)));
+  cardG.computeVertexNormals();
+  root.add(leaves.mesh(cut ? cardG : leafG, plant(0.5), { wind: 2, nb: 0.5, trans: LEAF_T, atlas: cut }));
+  root.add(fallen.mesh(cut ? cardG : leafG, plant(0.7), { nb: 0.6, atlas: cut }));
   root.add(petals.mesh(ribbon([[0, 0.15], [0.5, 0.5], [1, 0.3]], 0.1, -0.2), plant(0.6), { wind: 2, nb: 0.6, trans: [0.9, 0.8, 0.9] }));
   root.add(apples.mesh(bare(new THREE.SphereGeometry(1, 20, 14)), new THREE.MeshPhysicalMaterial({ roughness: 0.38, clearcoat: 0.4, clearcoatRoughness: 0.25 }), { wind: 2 }));
 
@@ -806,7 +834,7 @@ void main() {
     // it keeps the sky as half floats (max 65 504) and this sun is far brighter: hand it a dimmed copy, turn the light back up
     const src = sky.photo.tex, im = src.image as unknown as { width: number; height: number; data: Float32Array };
     let top = 0; for (let i = 0; i < im.data.length; i++) if (im.data[i] > top) top = im.data[i];
-    const dim = Math.max(1, Math.ceil(top / 60000)), envT = new THREE.DataTexture(im.data.map((v) => v / dim), im.width, im.height, src.format, src.type);
+    const dim = Math.max(1, Math.ceil(top / 60000)), envT = new THREE.DataTexture(im.data.map((v) => v / dim), im.width, im.height, src.format as THREE.PixelFormat, src.type);
     envT.flipY = src.flipY; envT.colorSpace = src.colorSpace; envT.wrapS = THREE.RepeatWrapping; envT.minFilter = envT.magFilter = THREE.LinearFilter; envT.needsUpdate = true;
     scene.environment = scene.background = envT;
     scene.environmentIntensity = scene.backgroundIntensity = sky.photo.k * dim;
@@ -871,15 +899,16 @@ void main() {
   };
 }
 
-/** passes: samples of our renderer. sky: a photo in public/js3d (see photoSky), "" = painted. plain: our renderer without
+/** passes: samples of our renderer. sky: a photo in public/js3d (see photoSky), "" = painted. scans: scanned bark,
+ * wood, stone and leaf shapes from public/js3d instead of the generated ones. plain: our renderer without
  * its tricks. pt: path-trace the plain scene with this many samples instead (reference only; needs a photo sky). */
-export const Js3dGarden: React.FC<{ passes?: number; sky?: string; plain?: boolean; pt?: number }> = ({ passes = 32, sky = "", plain = false, pt = 0 }) => {
+export const Js3dGarden: React.FC<{ passes?: number; sky?: string; scans?: boolean; plain?: boolean; pt?: number }> = ({ passes = 32, sky = "", scans = false, plain = false, pt = 0 }) => {
   const frame = useCurrentFrame();
   const canvas = useRef<HTMLCanvasElement>(null);
   const ctx = useRef<Promise<(fr: number, passes: number, pt?: number) => Promise<void>> | null>(null);
   useLayoutEffect(() => {
     const h = delayRender(`garden frame ${frame}`);
-    ctx.current ??= build(canvas.current!, sky, plain || pt > 0);
+    ctx.current ??= build(canvas.current!, sky, plain || pt > 0, scans);
     ctx.current.then((render) => render(frame, passes, pt)).then(() => continueRender(h)).catch((e) => cancelRender(e));
   }, [frame, passes, pt]);
   return (

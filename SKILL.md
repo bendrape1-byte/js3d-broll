@@ -38,7 +38,11 @@ mkdir -p ~/claude-code/animations/public/js3d && cp ~/.claude/skills/js3d-broll/
 cd ~/claude-code/animations && npm i three-gpu-pathtracer@0.0.27 three-mesh-bvh
 ```
 
-For outdoor scenes, a sky photo (23.8 MB, CC0; ask Ben before downloading, others are listed at polyhaven.com/hdris):
+For outdoor scenes, a sky photo (23.8 MB, CC0; ask Ben before downloading, others are listed at polyhaven.com/hdris),
+and for `scans: true` nine texture files from Poly Haven (18.6 MB: `bark_brown_02`, `rough_wood`, `concrete_floor_02`,
+each as `_diff_2k.jpg`, `_nor_gl_2k.jpg`, `_rough_2k.jpg`; URLs from `api.polyhaven.com/files/<name>`) plus
+`LeafSet004_1K-JPG_Color.jpg` and `_Opacity.jpg` from ambientcg.com (`get?file=LeafSet004_1K-JPG.zip`), all in
+`public/js3d/`:
 
 ```bash
 curl -L -o ~/claude-code/animations/public/js3d/spruit_sunrise_4k.hdr https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/4k/spruit_sunrise_4k.hdr
@@ -99,6 +103,17 @@ layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
   `scripts/hdri_stats.mjs` prints a photo's sun height, sun share and colours (run it inside the Remotion project).
   `sky: ""` falls back to `paintedSky()` (no file needed, every direction equally likely, `skyRad`). Set the photo in
   the composition's `defaultProps` (`{ passes: 32, sky: "spruit_sunrise" }`, Ben's pick of three for the garden).
+- **Scanned surfaces and leaf shapes** (prop `scans`). Bark, fence wood and stone are Poly Haven scans (colour,
+  normal and roughness map, 2k JPG) on the same UVs as the generated textures: `scan(name, repeatX, repeatY,
+  normalStrength)`. Around a branch the repeat must be a whole number or a seam shows. The bark needed normal
+  strength 2.5 and one tile per trunk girth; at strength 1 and two tiles it read as smooth clay from 7 m.
+  Leaves are cards cut out of a scanned leaf sheet (ambientCG LeafSet004: 6 leaves, colour + opacity): each
+  instance picks one of the six rectangles (`LEAVES`, measured from the opacity mask), the mask discards the rest
+  in the colour pass AND in the shadow pass (`customDepthMaterial`), and only the sheet's brightness is used
+  (veins, blotches) so the colour stays the instance's own. Other leaf sheets need their own `LEAVES` and
+  `LEAF_LUM`. In PLAIN mode the leaves fall back to the generated shape (a baked card would be a rectangle).
+  Cost: the cut-out leaves doubled the clip's render time (240 frames: 188 s -> 401 s). A card covers about three
+  times the area of the old leaf shape and every fragment of it reads the mask, in two shadow passes and the picture.
 - **Sunset photos have a very low sun** (8-12 deg in the three tested; a 1.5 m fence throws 10 m). `SUN_AZ` turns the
   photo so its sun comes in where nothing blocks it: 70 deg (from the right) for the garden.
 - **Sky light with real occlusion.** Besides the sun, every pass adds ONE more shadow-casting directional light from
