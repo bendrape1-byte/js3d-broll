@@ -1,6 +1,6 @@
 ---
 name: js3d-broll
-description: Lit 3D B-roll rendered in JavaScript (three.js inside the Remotion project) at near-Cycles quality in about a minute per clip instead of half an hour - figures like the crash-test dummy, props, objects, rooms, courts - as 1080x1920 (or 16:9) clips for a CapCut overlay. Soft shadows, depth of field, motion blur, glossy floor reflections and Blender's exact AgX colour. Use when an edit needs a 3D animation that is not anatomy (anatomy stays /anatomy-broll), when the user asks for 3D B-roll "in JavaScript" / "without Blender", or wants a Blender scene ported to JS.
+description: Lit 3D B-roll rendered in JavaScript (three.js inside the Remotion project) at near-Cycles quality in about a minute per clip instead of half an hour - figures like the crash-test dummy, props, objects, rooms, courts, and outdoor scenes lit by sun and sky (a garden with trees, grass, flowers, birds, a rabbit with fur) - as 1080x1920 (or 16:9) clips for a CapCut overlay. Soft shadows, depth of field, motion blur, glossy floor reflections and Blender's exact AgX colour. Use when an edit needs a 3D animation that is not anatomy (anatomy stays /anatomy-broll), when the user asks for 3D B-roll "in JavaScript" / "without Blender", or wants a Blender scene ported to JS.
 ---
 
 # js3d-broll
@@ -13,7 +13,11 @@ Monte Carlo idea, but one sample is a whole GPU frame, so a frame costs ~0.25 s.
 Proven 2026-11-05 on REEL-33's dummy (`template/DummyScene.tsx`): the Blender scene ported line by line rendered in
 49 s instead of 37 min 42 s, PSNR 31.2-33.0 dB per frame against Cycles' own PNGs, geometry aligned to the pixel.
 Visible only side by side: no real bounce light (a static environment probe instead), so faces turned to the floor
-are ~10-15/255 darker. Not yet used for a scene built from scratch.
+are ~10-15/255 darker.
+
+Built from scratch 2026-11-11 (`template/GardenScene.tsx`, no Blender original, no downloaded assets): a garden at
+golden hour, 3.65 million triangles, 240 frames at 32 passes in 3 min 30 s (0.87 s per frame; a test frame 3-9 s).
+That scene needed light, plants and fur the dummy never had; they are in the "Outdoor scenes" section below.
 
 **Not for anatomy**: translucent tissue (subsurface scattering) and the Z-Anatomy meshes are untested here; use
 /anatomy-broll (Ben wants anatomy to look like a medical render). Art direction as always: lit, moody 3D, never flat
@@ -38,11 +42,12 @@ mkdir -p public/js3d && cp ~/.claude/skills/js3d-broll/assets/agx_mhc_65.bin pub
 
 ## Make a clip
 
-1. Copy `template/DummyScene.tsx` to `~/claude-code/animations/src/<Client>/<Name>.tsx`, rename the export, register
-   it in `src/Root.tsx` (`<Composition id=... durationInFrames fps={30} width={1080} height={1920} defaultProps={{ passes: 32 }} />`).
+1. Pick the template nearer to the shot: `DummyScene.tsx` (studio or arena: spot + area lights, glossy floor, a posed
+   figure) or `GardenScene.tsx` (outdoors: sun + sky, plants, animals, haze). Copy it to
+   `~/claude-code/animations/src/<Client>/<Name>.tsx`, rename the export, register it in `src/Root.tsx` (`<Composition id=... durationInFrames fps={30} width={1080} height={1920} defaultProps={{ passes: 32 }} />`).
    Say so to Ben before touching Root.tsx; other sessions edit it too, so add lines, never rewrite it.
 2. Replace the scene, keep the engine (map below). Time events to words in frames, like the dummy's touchdown on "3-5".
-3. Test frames (8 passes is enough to judge pose and light; ~8 s each with bundling):
+3. Test frames (8 passes is enough to judge pose and light, not depth of field; 3-8 s each with bundling):
    `npx remotion still src/index.ts <Id> /tmp/f60.png --frame=60 --props='{"passes":8}'` - look at them.
 4. Render: `npx remotion render src/index.ts <Id> out.mp4 --image-format=png --concurrency=1` (~50 s for 150 frames),
    then drop Remotion's silent audio: `ffmpeg -i out.mp4 -an -c:v copy clip.mp4`.
@@ -64,6 +69,46 @@ Coordinates: everything sits in `root`, a group turned -90 deg about X, so posit
 single points with `b2t()` for things outside `root` (camera, area lights). Lens: vertical sensor 24 mm,
 `fov = 2 atan(12 / lens)`. Focus: `focus` = distance to the subject along the view.
 
+## Outdoor scenes: what GardenScene.tsx adds
+
+Engine (keep): `skyRad` + dome + `aim()` and the sun/sky block in the pass loop, `patch`, `Scatter`, `trans`, `fur`,
+`tex`, `ribbon`, `limb`, `loft`, `paint`, the haze sheets, the glow/vignette/grain output. Scene (replace): the
+layout constants, `growTree`'s numbers, the animals and their keys, `CAM`.
+
+- **Sky light with real occlusion.** Besides the sun, every pass adds ONE more shadow-casting directional light from
+  a sky direction (R2 sequence over the hemisphere, height 0.1..1), coloured `skyRad(direction)`, intensity
+  `2 pi * 0.9`. The mean of the passes is the integral over the sky, and because each sample has its own shadow map
+  the result is darker under bushes, between blades and under an animal: ambient occlusion that is measured, not
+  faked. A HemisphereLight with a black sky colour adds only the lawn's bounce from below. No environment map on
+  diffuse materials (it would count the sky twice); the PMREM of the dome goes on glossy things only (eyes, water).
+- **Shadow maps are fitted every pass.** `aim(light, direction)` projects the garden's bounding box into the light's
+  view and sets the orthographic frustum from it (sun 8192, sky 4096). The box must hold every caster whose shadow
+  reaches the frame; with a low sun that is far more than the frame (a 4 m crown throws 10 m).
+- **Plants are one mechanism: `Scatter`.** An InstancedBufferGeometry with our own per-instance attributes
+  (position, quaternion, scale, colour, volume normal, random), composed in `begin_vertex`. Not three's
+  InstancedMesh: its instance matrix is applied after `begin_vertex`, so wind could not move the final point. This
+  way every later chunk (projection, world position, shadow lookup) sees the finished vertex, and the same patch on
+  `customDepthMaterial` makes the shadows sway too. The garden holds 189 000 blades and 149 000 leaves this way.
+- **Foliage shading.** A lawn of correctly shaded blades looks like noise. Each instance carries a "volume normal"
+  (lawn: up; crown and bush: outward from the centre) and the leaf normal is blended towards it (`nb`), with the
+  DOUBLE_SIDED normal flip removed. Light from behind is added inside `RE_Direct_Physical` (`trans`: backlit leaves,
+  grass, wings and fur glow, and still take shadows). Blades get darker towards the foot (`root`).
+- **Wind** is a function of position and `uTime`, and `uTime` is the pass's own sub-frame time, so it motion-blurs.
+  Wood and leaves read the same `sway()` field, so leaves stay on their twigs without any rig.
+- **Fur = shells** (`fur()`): the painted mesh drawn 18 times as instances, each pushed further out along the normal
+  and combed back; a 3D hash of the skin point decides per cell how long the strand is and discards the rest.
+  Per-vertex `furLen` keeps eyes and paws clear. Shell spacing must stay under 1 px or the layers show as contour
+  lines at the silhouette. Fur also hides the seams between rigid parts (head, ears, body are separate meshes).
+- **Animals** are lofts from a side view (`loft`: rows of y, z, half width, half height), painted per vertex
+  (`paint`), moved as rigid groups with stepped spline keys. Birds move in jerks: hold a pose, change it in 3 frames.
+- **Trees**: a leader that tapers to a tip with side branches along its upper part, each turned ~137 deg from the
+  last and shorter the higher it sits; twigs under 2 cm carry the leaves. Forking only at the tip of each branch
+  (the first attempt) gives a candelabra.
+- **Haze and light shafts**: 28 camera-facing sheets of additive Lambert "air" whose normal is forced to the sun and
+  which receive shadows. Summed, the air is lit except in the crown's shadow. Their depths shift every pass.
+- **Look**: the dome is drawn 0.62x darker than it lights (a white sky otherwise); glow = 8 % of the frame's own mip
+  chain; vignette; 1.4 % grain seeded by the frame number; FogExp2 for the far distance.
+
 ## Measured facts (do not re-derive)
 
 - Colour: Blender 5.2's AgX is not three.js's `AgXToneMapping` (grey 0.18 -> 118 vs 128, up to 48/255 off). The
@@ -81,8 +126,19 @@ single points with `b2t()` for things outside `root` (camera, area lights). Lens
 
 ## Pitfalls
 
+- One `onBeforeCompile` function serving several variants (closure parameters) needs `customProgramCacheKey`:
+  three caches the program by the function's source text and silently reuses the first variant for all.
+- `vertexColors: true` on a geometry without a `color` attribute renders black. No warning.
+- A JS number pasted into GLSL must be a float literal (`x.toFixed(5)`): `vBase * 700` does not compile.
+- Internal shader names change between three versions (r185: `material.diffuseContribution`, not `diffuseColor`).
+  Grep the chunk in `node_modules/three/src/renderers/shaders/ShaderChunk/` before patching it.
+- Depth of field needs passes: each pass is one sharp copy of the scene, so few passes show a blur as ghost copies.
+  f/1.4 at 8 passes (crown ~12 px out of focus) smeared the whole tree; f/2 at 16-32 passes was clean. Judge blur
+  at 32 passes, not on the 8-pass test frames.
+
 - `remotion still` does not print the browser console: a shader that fails to compile shows up only as a missing or
   black object. Two `onBeforeCompile` injections declaring the same variable name in `main()` did exactly that.
+  GardenScene.tsx sets `renderer.debug.onShaderError` to throw the compile log, which `cancelRender` then prints.
 - Comparing against a Blender clip: use its PNG frames, not the CapCut MP4 (bt709 tv-range re-encode). SSIM is
   useless on these dark frames (an MP4 against its own PNG scores 0.83); use PSNR at quarter size, mean colour of
   named regions, and edge registration with a planted-shift control for geometry.
